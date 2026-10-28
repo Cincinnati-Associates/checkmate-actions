@@ -11,7 +11,7 @@ name: Checkmate agent fix
 # changes what references the manager (scripts, Dockerfile, vercel.json, docs),
 # and lists what it cannot change under .github/ for a person to apply.
 #
-# PASSES (INFOSEC-1178, layer 3)
+# PASSES (layer 3)
 #
 # The agent, resolve and pre-review jobs below are one pass, in
 # agent-fix-round.yml. A pass whose pre-review finds nothing that blocks a
@@ -106,7 +106,7 @@ concurrency:
 
 jobs:
   # The reviewer's own rule catalogues, for the agent to meet before it is
-  # judged by them (INFOSEC-1178, layer 1). The reviewer repo is private, so
+  # judged by them (layer 1). The reviewer repo is private, so
   # a token from Checkmate reads it here, limited to that repository and to
   # contents, and is revoked right after the checkout. This job never sees the Claude
   # credential, runs no agent, and hands on only the skill files.
@@ -233,7 +233,7 @@ jobs:
           include-hidden-files: true
           retention-days: 1
 
-  # Up to three passes (INFOSEC-1178, layer 3): the first, and at most two more
+  # Up to three passes (layer 3): the first, and at most two more
   # while the pre-review still finds something that blocks a merge and the cost
   # cap is not reached. Actions has no loops, so they are three calls.
   round1:

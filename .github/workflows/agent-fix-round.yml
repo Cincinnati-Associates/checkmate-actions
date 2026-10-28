@@ -455,7 +455,7 @@ jobs:
             *) echo "::error::no resolver for $base"; exit 1 ;;
           esac
 
-      # INFOSEC-1178, layer 2: what the review would reject for certain, checked
+      # layer 2: what the review would reject for certain, checked
       # here, where there is no secret and no model cost. Any failure: no pull
       # request, and the reason is the run's error annotation.
       - name: Check the change before a pull request
@@ -695,7 +695,7 @@ jobs:
           path: ${{ runner.temp }}/change
           retention-days: 1
 
-  # INFOSEC-1178, layer 3: the pre-publish self-review. The resolved change is
+  # layer 3: the pre-publish self-review. The resolved change is
   # reviewed against the same rule skills, by the same enumerators, from the
   # same reviewer ref as Lindamar review; its merge-blocking findings go back to
   # the agent for another pass, or the pull request opens only when there are
