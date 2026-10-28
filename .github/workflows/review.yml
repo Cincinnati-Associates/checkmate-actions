@@ -1,0 +1,1801 @@
+name: Lindamar review
+
+# Reusable workflow. A repo opts in with a short caller (see README.md) and
+# needs one secret of its own.
+#
+# TOKENS COME FROM CHECKMATE, NOT FROM A SECRET
+#
+# This workflow is public so that repositories in any organisation can call it.
+# The reviewer's skills and scripts stay in the private repository
+# Cincinnati-Associates/lindamar-reviewer, and each job that needs them asks the
+# caller's Checkmate tenant for a short-lived read token through GitHub Actions
+# OIDC (`checkmate-url`). No App private key is held by the caller. A reusable
+# workflow cannot raise its caller's permissions, so the CALLING JOB must grant
+# `id-token: write`; without it the token step fails and says so.
+#
+# WHY THIS IS A JOB AND NOT A REVIEW VERDICT
+#
+# A GitHub App cannot gate a merge. Both halves were tested against a
+# repository whose main requires one approving review:
+#
+#   - An APPROVE from the App is accepted and recorded, and mergeable_state stays
+#     "blocked" — with every required check green, the branch up to date, and no
+#     CODEOWNERS rule. A human approval on the same branch cleared it and merged.
+#   - A REQUEST_CHANGES from the App leaves mergeable_state "clean".
+#
+# So App reviews are excluded from branch protection in both directions. What
+# does gate is a required status check, which is what that repo already gates on
+# today. This job failing IS that check — no extra permission, no check-runs API.
+#
+# The consequence is worth stating plainly: the review comment is for people to
+# read, and the job's exit status is the enforcement. Nothing here produces an
+# approval that stands in for human sign-off.
+#
+# THE TRUST BOUNDARY, because the reviewer flagged this workflow itself (sec-701)
+#
+# Half of that finding does not apply and half of it does, and the difference is
+# worth writing down rather than rediscovering.
+#
+# What does NOT apply: the classic shape of sec-701 is a privileged workflow that
+# checks out pull-request code and runs it. Nothing here checks out the calling
+# repo. The only checkout is the reviewer itself; the diff arrives as text over
+# the API, so there is no PR-authored file on disk for anything to execute. This
+# is also why `pull_request_target` is not used and must not be.
+#
+# What DOES apply: the agent reads attacker-influenceable text with tools
+# available, so prompt injection through the diff is a real risk. What is done
+# about it:
+#   - No App credential is in the review step. The reviewer read token exists
+#     only for the checkout and is revoked right after it.
+#   - The Anthropic key is per repo, so the blast radius of a leak is one repo's
+#     key rather than the organisation's. That is a second reason for the per-repo split,
+#     beyond billing.
+#   - GITHUB_TOKEN is the calling repo's own and holds no cross-repo access.
+#
+# What is NOT solved: a review can still be talked into writing something
+# misleading on the pull request. The residual assumption is that PR authors are
+# organisation members, with no forks: a fork PR would get no secrets and
+# simply not run. Enabling forks or adding outside collaborators changes this
+# calculation and should be revisited before it happens.
+
+on:
+  workflow_call:
+    inputs:
+      checkmate-url:
+        description: "Your Checkmate console URL, e.g. https://<tenant>.example.com, with no trailing slash. It is the OIDC audience and the base of the token exchange (POST <checkmate-url>/v1/actions/token). The calling job must grant `id-token: write`."
+        type: string
+        required: true
+      fail-on-critical:
+        description: "Fail the job when a critical finding is posted. This is the gate — turn it off to run advisory-only."
+        type: boolean
+        default: true
+      claude-credential:
+        description: "api-key or subscription. CI should use api-key: a subscription token is a person's own credential and bills to them."
+        type: string
+        default: api-key
+      reviewer-ref:
+        description: "Ref of the reviewer repo to check out for the run. Defaults to the caller's own ref so a pinned caller stays pinned end to end; @main here would have quietly un-pinned it."
+        type: string
+        default: v1
+      timeout-minutes:
+        type: number
+        default: 45
+      max-auto-rounds:
+        description: "Most rounds that run the model on one pull request before a push stops starting one by itself. Each round is a full paid review; one pull request in an earlier incident reached nine in a few hours. At the cap, and while the last round blocked, the check fails without spending and says to fix everything in one push and start the next review by hand. A hand-started run is never capped; it skips only a commit that already has a verdict, unless a person started it and that verdict blocks, in which case it rules again. 0 means no cap."
+        type: number
+        default: 3
+      model:
+        description: "Pinned so cost does not depend on which machine ran the review. Unpinned, the same pull request cost $11-13 locally on opus-1m at 34-36k output tokens and $2.29-2.75 in CI at 12-15k — a 4x spread that makes any per-repo quote meaningless."
+        type: string
+        default: claude-opus-5
+      verdict-mode:
+        description: "How the review is posted. comment-only is the default and the right one for a gate with no human in it: a bot's REQUEST_CHANGES blocks a merge and then needs a person to dismiss it, while a COMMENT plus this job's failing check blocks just as hard and clears itself on the next green run. full-auto also attempts APPROVE, which a GitHub App cannot do — its approval does not count toward required reviews."
+        type: string
+        default: comment-only
+      upload-transcript:
+        description: "Upload the raw agent transcript as an artifact. It quotes the diff — in a client repo that is their source — so this is off unless you are debugging a specific run."
+        type: boolean
+        default: false
+      pr:
+        description: "Pull request number, for a run started by hand instead of by a pull_request event. Adding this workflow to a repository's default branch fires no event on the pull requests already open there, so without this they are never reviewed until somebody happens to push to one. Leave it empty on the normal path."
+        type: string
+        default: ""
+      status-context:
+        description: "Name of the required status check this review satisfies, used only on the hand-started path. It is NOT the workflow name: GitHub names a reusable-workflow job `<caller job id> / <called job name>`, so the shipped caller produces `review / Lindamar review` — verified against branch protection on two repos, both of which require exactly that string. Getting it wrong is silent: the status posts, the step prints success, and the pull request stays blocked on a check nothing ever satisfies. Change it only if your caller renames the job."
+        type: string
+        default: "review / Lindamar review"
+    secrets:
+      ANTHROPIC_API_KEY:
+        description: "Set per repo, so each client's review cost bills to that client."
+        required: false
+      CLAUDE_CODE_OAUTH_TOKEN:
+        required: false
+      LINDAMAR_SLACK_BOT_TOKEN:
+        description: "Bot token with chat:write. Preferred over the webhook: a webhook's messages belong to the webhook, so nothing can later edit or delete them — proven by chat.delete returning cant_delete_message on them while the same token deletes its own posts fine. With a bot token the run posts once and edits that message into the result, instead of leaving two."
+        required: false
+      LINDAMAR_SLACK_CHANNEL:
+        description: "Channel id for the bot token. A webhook carries its channel; a bot token does not."
+        required: false
+      LINDAMAR_SLACK_WEBHOOK:
+        description: "Incoming webhook for review notifications. Org-level: it is the same channel everywhere, and it is not a cost credential. Omit it and the review runs silently."
+        required: false
+      LINDAMAR_FINDINGS_KEY:
+        description: "Root of the key that signs each review's findings block. Only the post job reads it, and only through HKDF. Without it nothing is signed, so nothing is carried between rounds and every push is a full review. Any long random string; generate with `openssl rand -hex 32`."
+        required: false
+      LINDAMAR_APPROVER_PAT:
+        description: "A generic account's fine-grained PAT, used ONLY to approve when nothing blocks. GitHub accepts an approval from a user identity and from nothing else — not a GitHub App, not GITHUB_TOKEN, not a ruleset bypass; all three were tested. Omit it to leave approving to a person."
+        required: false
+
+# A push mid-review makes the findings describe a commit that no longer exists,
+# and the inline anchors were computed against it. Here GitHub cancels the
+# stale run.
+concurrency:
+  # The event is part of the GROUP, not a condition on cancel-in-progress. An
+  # expression in `cancel-in-progress` made the whole workflow unparseable —
+  # "This run likely failed because of a workflow file issue", every job in every
+  # repository, with no annotation naming the line. Putting the event in the key
+  # gets the same property with plain interpolation, which is supported.
+  #
+  # The property wanted: a push cancels a running review, because the commit it
+  # was judging no longer exists. A hand-started run must not, because it is a
+  # RETRY — cancelling the review it is waiting for and paying for a replacement
+  # is the opposite of the job. Different groups cannot cancel each other.
+  group: lindamar-review-${{ github.event.pull_request.number || inputs.pr || github.ref }}-${{ github.event_name }}
+  cancel-in-progress: true
+
+# The Claude CLI, pinned. Unpinned, every run installed whatever npm called
+# latest that minute, which is how a new print-mode default (a 10-minute ceiling
+# on background sub-agents) reached the review unannounced (#73). 2.1.296 is the
+# version the green reviews of #72 and #68 ran on 2026-10-09. To move it, change
+# this line and the same line in agent-fix-round.yml; scripts/test-cli-pin.sh fails while they
+# disagree or while any install site is unpinned.
+env:
+  LINDAMAR_CLAUDE_CLI_VERSION: "2.1.296"
+
+jobs:
+  # THE AGENT JOB HOLDS NOTHING THAT CAN WRITE (sec-104).
+  #
+  # It runs an unattended agent with --dangerously-skip-permissions over diff text
+  # anyone can open a pull request with. A job-level permission belongs to every
+  # step in the job, so whatever this job may do, a prompt injection in a diff may
+  # do. It used to hold pull-requests: write, and the agent posted its own review —
+  # so an injection could post as the reviewer, plant an empty findings block, and
+  # make the next round carry nothing.
+  #
+  # So this job reads, decides and reviews, and writes its review to a file. The
+  # job below, `review`, runs no model and never reads diff text as instructions:
+  # it validates that file, re-reads the previous round with the signing key, and
+  # is the only thing that posts, gates, approves or withdraws. It also holds the
+  # job name the required check is keyed on, `review / Lindamar review`, so the
+  # split is invisible to branch protection and to every caller.
+  #
+  # LINDAMAR_FINDINGS_KEY never appears in this job. scripts/test-review-split.sh
+  # fails if it does, or if this job asks for any write scope.
+  agent:
+    name: Lindamar agent
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.pr.outputs.sha }}
+      number: ${{ steps.pr.outputs.number }}
+      url: ${{ steps.pr.outputs.url }}
+      title: ${{ steps.pr.outputs.title }}
+      author: ${{ steps.pr.outputs.author }}
+      dispatched: ${{ steps.pr.outputs.dispatched }}
+      skip: ${{ steps.triage.outputs.skip }}
+      carried_from: ${{ steps.triage.outputs.carried_from }}
+      carry_approve: ${{ steps.triage.outputs.carry_approve }}
+      rounds: ${{ steps.triage.outputs.rounds }}
+      scope: ${{ steps.triage.outputs.scope }}
+      scope_from: ${{ steps.triage.outputs.scope_from }}
+      scope_total: ${{ steps.triage.outputs.scope_total }}
+      already: ${{ steps.already.outputs.skip }}
+      ran: ${{ steps.review.outputs.ran }}
+      blocked: ${{ steps.review.outputs.blocked }}
+      reset_at: ${{ steps.review.outputs.resetAt }}
+      slack_ts: ${{ steps.slackstart.outputs.ts }}
+      cost: ${{ steps.cost.outputs.cost }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    permissions:
+      contents: read
+      pull-requests: read
+      # Only to fetch the OIDC token that the reviewer read token is exchanged
+      # for. It writes nothing to the repository. The Review step removes the
+      # request variables from the agent's environment.
+      id-token: write
+
+    steps:
+      # Resolved once, here, instead of every later step reading
+      # github.event.pull_request.* directly — which only has a value when a
+      # pull_request event started the run. That is why a pull request already
+      # open when this workflow was installed could never be reviewed: merging
+      # the workflow into the default branch fires no event on it, and nothing
+      # here could name a pull request the event did not hand over.
+      - name: Work out which pull request this is
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          INPUT_PR: ${{ inputs.pr }}
+          EVENT_PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -uo pipefail
+          n="${INPUT_PR:-}"; [ -n "$n" ] || n="${EVENT_PR:-}"
+          if [ -z "$n" ]; then
+            echo "::error title=No pull request::This run was not started by a pull_request event and no \`pr\` input was given, so there is nothing to review."
+            exit 1
+          fi
+          case "$n" in ''|*[!0-9]*)
+            echo "::error title=Not a pull request number::Got \`$n\`."; exit 1 ;;
+          esac
+          pr="$(gh api "repos/$REPO/pulls/$n" 2>/dev/null)" || pr=""
+          [ -n "$pr" ] || { echo "::error title=No such pull request::$REPO#$n"; exit 1; }
+          state="$(printf '%s' "$pr" | jq -r '.state')"
+          if [ "$state" != "open" ]; then
+            echo "::error title=Pull request is $state::$REPO#$n is not open. Reviewing it would spend the run posting findings on something nobody is going to merge."
+            exit 1
+          fi
+          {
+            printf 'number=%s\n'     "$n"
+            printf 'sha=%s\n'        "$(printf '%s' "$pr" | jq -r '.head.sha')"
+            printf 'base_sha=%s\n'   "$(printf '%s' "$pr" | jq -r '.base.sha // ""')"
+            printf 'url=%s\n'        "$(printf '%s' "$pr" | jq -r '.html_url')"
+            printf 'author=%s\n'     "$(printf '%s' "$pr" | jq -r '.user.login')"
+            printf 'draft=%s\n'      "$(printf '%s' "$pr" | jq -r '.draft')"
+            printf 'author_type=%s\n' "$(printf '%s' "$pr" | jq -r '.user.type')"
+            printf 'head_ref=%s\n'   "$(printf '%s' "$pr" | jq -r '.head.ref')"
+            printf 'head_repo=%s\n'  "$(printf '%s' "$pr" | jq -r '.head.repo.full_name // ""')"
+            printf 'changed=%s\n'    "$(printf '%s' "$pr" | jq -r '.changed_files')"
+            printf 'dispatched=%s\n' "$([ -n "${INPUT_PR:-}" ] && echo true || echo false)"
+          } >> "$GITHUB_OUTPUT"
+          # A title is arbitrary text and can hold newlines, so it goes through the
+          # delimited form. The delimiter is randomised because a title that
+          # contained a fixed one could close the block early and write whatever
+          # followed as further outputs.
+          d="LINDAMAR_$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+          {
+            printf 'title<<%s\n' "$d"
+            printf '%s\n' "$(printf '%s' "$pr" | jq -r '.title')"
+            printf '%s\n' "$d"
+          } >> "$GITHUB_OUTPUT"
+          printf '  %s#%s at %s (started %s)\n' "$REPO" "$n" \
+            "$(printf '%s' "$pr" | jq -r '.head.sha')" \
+            "$([ -n "${INPUT_PR:-}" ] && echo "by hand" || echo "by the pull request")"
+
+      # Before the credential check, not after: a Dependabot pull request gets
+      # no Actions secrets at all, so checking the credential first turned every
+      # dependency bump into a red check that said "missing ANTHROPIC_API_KEY".
+      #
+      # Only on the pull_request path. A run started by hand is somebody asking
+      # for this pull request by number, and asking is the whole signal.
+      #
+      # A skip still finishes the run, and the post job IS the required check, so a
+      # skipped pull request gets a green `review / Lindamar review` in seconds
+      # with the reason on it, instead of a check that waits for ever. Every
+      # rule fails toward reviewing: anything it cannot read, it reviews. The
+      # one red skip is `capped`, the automatic budget: nothing was reviewed.
+      - name: Decide whether this pull request needs a review
+        id: triage
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ steps.pr.outputs.number }}
+          EVENT: ${{ github.event_name }}
+          ACTION: ${{ github.event.action }}
+          DISPATCHED: ${{ steps.pr.outputs.dispatched }}
+          DRAFT: ${{ steps.pr.outputs.draft }}
+          AUTHOR: ${{ steps.pr.outputs.author }}
+          AUTHOR_TYPE: ${{ steps.pr.outputs.author_type }}
+          HEAD_REF: ${{ steps.pr.outputs.head_ref }}
+          HEAD_REPO: ${{ steps.pr.outputs.head_repo }}
+          SHA: ${{ steps.pr.outputs.sha }}
+          BASE_SHA: ${{ steps.pr.outputs.base_sha }}
+          CHANGED: ${{ steps.pr.outputs.changed }}
+          MAX_AUTO_ROUNDS: ${{ inputs.max-auto-rounds }}
+          # sha256 of docs/install/lindamar-review.yml with its credential line
+          # read as `claude-credential: CREDENTIAL`, and of the retry template
+          # as is. scripts/test-review-triage.sh fails when either template
+          # changes and these do not.
+          INSTALL_TEMPLATE_SHA256: 1f0e0e068f420858bd380a12a3a4b59db36ed22f102739036a74827691696579
+          RETRY_TEMPLATE_SHA256: 8311757a1233a18701d746f5765daf705d3614f27dba4bda67b06db939a61dc9
+        run: |
+          set -uo pipefail
+          skip() { printf 'skip=%s\n' "$1" >> "$GITHUB_OUTPUT"; echo "  skipped: $1 — $2"; exit 0; }
+          # Below the cheap skips every `review` passes the budget first (see
+          # budget(), armed after the docs rule). Above them it is what it was.
+          armed=0
+          review() { if [ "$armed" = 1 ]; then budget; fi; echo "  reviewing: $1"; exit 0; }
+          # A safety case: the review must re-read the whole pull request, not
+          # whatever narrower scope the skill would pick for itself. Every other
+          # `review` leaves the scope to the skill, exactly as before triage
+          # could scope a round, so no run re-reads more than it used to.
+          full() { printf 'scope=full\n' >> "$GITHUB_OUTPUT"; review "$1; full review"; }
+
+          [ "$EVENT" = "pull_request" ] || review "started by $EVENT, not by the pull request"
+          [ "$DISPATCHED" = "true" ] && review "started by hand"
+
+          # A draft is not asking for a verdict yet. The caller filters drafts
+          # too; this is for a caller that does not. `ready_for_review` arrives
+          # with draft=false and is reviewed like any other push.
+          [ "$DRAFT" = "true" ] && skip draft "a draft is reviewed once it is marked ready"
+
+          # Every path the pull request touches, before and after a rename. A
+          # rename of `deploy.sh` to `deploy.md` is a change to deploy.sh.
+          files="$(gh api --paginate "repos/$REPO/pulls/$PR/files?per_page=100" 2>/dev/null || true)"
+          paths="$(printf '%s' "$files" | jq -s -r '
+              if all(.[]; type == "array") then add // [] | .[] | (.filename, (.previous_filename // empty))
+              else error("not a file listing") end' 2>/dev/null)" || review "could not read the changed files"
+          listed="$(printf '%s' "$files" | jq -s 'if all(.[]; type == "array") then add // [] | length else -1 end' 2>/dev/null || echo -1)"
+          # GitHub lists at most 3000 files. A listing shorter than the count the
+          # pull request itself reports is not the whole change.
+          [ -n "$paths" ] || review "no changed files could be listed"
+          [ "$listed" = "${CHANGED:-x}" ] || review "listed $listed file(s) of ${CHANGED:-?}"
+
+          # The reviewer's own install pull request, opened by the Checkmate
+          # console: the App, from its branch,
+          # adding or updating the caller and nothing else. Reviewing it spends a
+          # review on a file whose every byte is ours. So it passes when the file
+          # at the head commit IS the template, byte for byte, with only the
+          # credential line free to say api-key or subscription. Any other edit
+          # to this workflow is the edit that most needs a review, and gets one.
+          install_file_ok() {  # install_file_ok <path> <want-sha256> <normalise:0|1>
+            local got
+            got="$(gh api -H "Accept: application/vnd.github.raw" "repos/$REPO/contents/$1?ref=$SHA" 2>/dev/null \
+                    | if [ "$3" = 1 ]; then
+                        sed -E 's/^      claude-credential: (api-key|subscription)$/      claude-credential: CREDENTIAL/'
+                      else cat; fi \
+                    | openssl dgst -sha256 -r | cut -d' ' -f1 || true)"
+            [ -n "$got" ] && [ "$got" = "$2" ]
+          }
+          if [ "$HEAD_REF" = "lindamar/pipeline-v1" ] && [ "$HEAD_REPO" = "$REPO" ] \
+             && [ "$AUTHOR" = "lindamar-reviewer[bot]" ] && [ "$AUTHOR_TYPE" = "Bot" ]; then
+            verdict=ok; caller=0
+            while IFS= read -r p; do
+              case "$p" in
+                .github/workflows/lindamar-review.yml)
+                  caller=1; install_file_ok "$p" "$INSTALL_TEMPLATE_SHA256" 1 || verdict="$p is not the template" ;;
+                .github/workflows/lindamar-review-retry.yml)
+                  install_file_ok "$p" "$RETRY_TEMPLATE_SHA256" 0 || verdict="$p is not the template" ;;
+                *) verdict="it also changes $p" ;;
+              esac
+              [ "$verdict" = ok ] || break
+            done <<< "$paths"
+            [ "$caller" -eq 1 ] || verdict="it does not change the caller"
+            [ "$verdict" = ok ] && skip install "the App's install pull request, and the caller is the template"
+            echo "  an install pull request, reviewed: $verdict"
+          fi
+
+          # CI's own code: workflows and composite actions. A bot that edits
+          # them is the case worth a review, not the case worth skipping.
+          ci=0
+          while IFS= read -r p; do
+            case "$p" in .github/workflows/*|.github/actions/*) ci=1 ;; esac
+          done <<< "$paths"
+
+          # Named accounts only. An unknown bot is reviewed: this list is a
+          # decision about three services, not about anything that ends in [bot].
+          case "$AUTHOR" in
+            "dependabot[bot]"|"renovate[bot]"|"github-actions[bot]")
+              [ "$ci" -eq 1 ] || skip bot "$AUTHOR, and nothing under .github/workflows or .github/actions" ;;
+          esac
+
+          # Docs only, and narrowly. A path is documentation when it is not in a
+          # dot-directory (other than .github/ISSUE_TEMPLATE), is not something
+          # an agent executes as instructions (CLAUDE.md, a skill, a prompt), and
+          # is a markdown file, a LICENSE, an issue template, or a text or image
+          # file under docs/. docs/ is not blanket: in this very repository it
+          # holds the workflow every consumer installs.
+          docs_only() {
+            local p base lower
+            p="$1"; base="${p##*/}"; lower="$(printf '%s' "$p" | tr 'A-Z' 'a-z')"
+            case "/$p" in
+              /.github/ISSUE_TEMPLATE/*) return 0 ;;
+              */.*) return 1 ;;
+            esac
+            case "$base" in
+              CLAUDE.md|AGENTS.md|GEMINI.md|SKILL.md|copilot-instructions.md) return 1 ;;
+            esac
+            case "/$lower/" in
+              */skills/*|*/prompts/*|*/agents/*|*/commands/*) return 1 ;;
+            esac
+            [ "$base" = "LICENSE" ] && return 0
+            case "$lower" in *.md) return 0 ;; esac
+            case "$lower" in
+              docs/*.txt|docs/*.rst|docs/*.png|docs/*.jpg|docs/*.jpeg|docs/*.gif|docs/*.webp) return 0 ;;
+            esac
+            return 1
+          }
+          why=""
+          while IFS= read -r p; do
+            docs_only "$p" || { why="$p is not documentation"; break; }
+          done <<< "$paths"
+          [ -n "$why" ] || skip docs "every changed file is documentation"
+
+          # THE AUTOMATIC BUDGET. Every push to a pull request the reviewer has
+          # not passed starts a full paid review, with no ceiling: an earlier
+          # incident ran nine in a few hours at $7-9 each. From here on, a push that
+          # would run the model first counts the rounds that already did, and at
+          # max-auto-rounds, while the last of them blocked, it runs nothing and
+          # the gate fails the check with how to go on. Armed only here, so the
+          # rules above still cost nothing, and only on this path: a run started
+          # by hand returned above and is never capped (the step "Stop early if
+          # this commit already has a verdict" decides whether it spends). A
+          # carry below spends nothing and still wins.
+          #
+          # A round is a review the post job posted: github-actions[bot], the
+          # verdict heading, and a findings block for the commit it was posted
+          # on. post-review.sh writes one per round that ran the model and none
+          # for a carry or a skip. Nobody else's comment or review counts. This
+          # job has no key, so a signature cannot be checked here — but only an
+          # Actions token posts as that login, and a forged round can only RAISE
+          # the count, which spends less. The one forgery that spends is a fake
+          # non-blocking "last round", and that buys a review, never a pass: the
+          # gate trusts nothing it cannot verify with the key. Anything that
+          # cannot be read reviews, like every rule above.
+          budget() {
+            local max revs tally rounds last
+            max="${MAX_AUTO_ROUNDS:-}"
+            case "$max" in ''|*[!0-9]*) echo "  budget: max-auto-rounds is '$max', not a count; no cap"; return 0 ;; esac
+            [ "$max" -gt 0 ] || return 0
+            revs="$(gh api --paginate "repos/$REPO/pulls/$PR/reviews" 2>/dev/null || true)"
+            tally="$(printf '%s' "$revs" | jq -s -c '
+                if length > 0 and all(.[]; type == "array") then . else error("not a review listing") end
+                | [ (add // [])[]
+                    | select((.user.login // "") == "github-actions[bot]")
+                    | select((.body // "") | contains("Lindamar Code Review Result"))
+                    | .commit_id as $c
+                    | ((.body // "") | split("\n<!-- lindamar-findings\n")
+                       | if length < 2 then null else (last | split("\n-->") | .[0] | (try fromjson catch null)) end) as $p
+                    | select(($p | type) == "object"
+                             and ($p.schema | type) == "string" and ($p.schema | startswith("lindamar-review/"))
+                             and ($p.headSha | type) == "string" and $p.headSha == $c)
+                    | ($p.verdict // "") ]
+                | { rounds: length, last: (last // "") }' 2>/dev/null)" || tally=""
+            rounds="$(printf '%s' "$tally" | jq -r '.rounds | select(type == "number") | tostring' 2>/dev/null || true)"
+            case "$rounds" in ''|*[!0-9]*) echo "  budget: the earlier rounds could not be counted"; return 0 ;; esac
+            last="$(printf '%s' "$tally" | jq -r '.last | tostring' 2>/dev/null || true)"
+            if [ "$rounds" -lt "$max" ]; then echo "  budget: $rounds of $max automatic round(s) used"; return 0; fi
+            # Only a round that blocked holds the cap. COMMENT is never a block:
+            # post-review.sh raises any verdict with an open critical to REJECTED.
+            if [ "$last" != "REJECTED" ]; then echo "  budget: $rounds round(s), but the last one did not block ($last)"; return 0; fi
+            printf 'rounds=%s\n' "$rounds" >> "$GITHUB_OUTPUT"
+            skip capped "$rounds automatic round(s) already ran (max-auto-rounds $max) and the last one blocked; start the next by hand"
+          }
+          armed=1
+
+          # A push that leaves the pull request's own change exactly as it was
+          # at the last head the reviewer ruled on: the typical one merges main
+          # into the branch to resolve a conflict in somebody else's file. It
+          # re-ran the whole review, and in an earlier incident that was a large part
+          # of why one pull request reached five to seven full reviews and the
+          # quota ran out under everybody else. The previous verdict is carried
+          # instead: the gate below re-reads it from that review and decides
+          # exactly as it did then.
+          #
+          # "Own change" is merge-base(base, head)..head, per file, compared as
+          # the patch with its hunk headers blanked — so main moving lines
+          # above the change does not count, and a force-push that rewrites
+          # history but not content carries like anything else. Every rule here
+          # fails toward reviewing, and nothing is carried that was not posted.
+          [ "${ACTION:-}" = "synchronize" ] || review "$why"
+          [ -n "${BASE_SHA:-}" ] || review "$why; no base commit to diff against"
+          t="$(mktemp -d)"
+          revs="$(gh api --paginate "repos/$REPO/pulls/$PR/reviews" 2>/dev/null || true)"
+          printf '%s' "$revs" | jq -s -e 'all(.[]; type == "array")' >/dev/null 2>&1 \
+            || review "$why; the earlier reviews could not be read"
+          # The last verdict the reviewer posted, on any commit but this one.
+          printf '%s' "$revs" | jq -s '[ (add // [])[]
+              | select(.user.login == "github-actions[bot]")
+              | select((.body // "") | contains("Lindamar Code Review Result"))
+              | select(.commit_id != env.SHA) ] | last // {}' > "$t/prev.json" 2>/dev/null \
+            || review "$why; the earlier reviews could not be read"
+          prev="$(jq -r '.commit_id // empty' "$t/prev.json")"
+          [ -n "$prev" ] || full "$why; no earlier verdict to carry"
+          # The verdict from the findings block post-review.sh embeds, not from
+          # the heading: post-review.sh can raise a verdict after the summary
+          # was written. The payload is the line after the opening marker, and
+          # it must name the commit it was posted on and carry a signature.
+          # This job has no key, so it cannot check the signature — only that
+          # one is there. The post job verifies it before the gate reads the
+          # carried verdict, and an unsigned block (every review before
+          # signing existed) is never carried: that push gets a full review.
+          verdict="$(jq -r '.body' "$t/prev.json" \
+                     | awk 'l ~ /<!-- lindamar-findings$/ { x = $0 } { l = $0 } END { print x }' \
+                     | jq -r --arg sha "$prev" 'select(.schema == "lindamar-review/1" and .headSha == $sha and .sig.v == 1)
+                                                | .verdict | select(. == "APPROVED" or . == "REJECTED" or . == "COMMENT")' 2>/dev/null || true)"
+          [ -n "$verdict" ] || review "$why; the verdict on ${prev:0:8} cannot be read"
+          # own_diff <head> > file: {path: normalised patch}, for every file in
+          # merge-base(base, head)..head. Fails when the answer is not whole:
+          # an error body, the compare API's 300-file cap, or a file with no
+          # patch to compare (binary, or too large for the API to inline).
+          own_diff() {
+            gh api --paginate "repos/$REPO/compare/$BASE_SHA...$1" 2>/dev/null | jq -s -e '
+              if length > 0 and all(.[]; type == "object" and has("files")) then . else error("not a compare") end
+              | [ .[] | .files[] ] | unique_by(.filename)
+              | if length >= 300 then error("at the file cap") else . end
+              | map({ key: .filename,
+                      value: ((.patch // (if .status == "renamed" and (.changes // 0) == 0 then "" else error("no patch") end))
+                              | split("\n") | map(if startswith("@@") then "@@" else . end) | join("\n")
+                              | "\(.)\n" ) })
+              | from_entries' 2>/dev/null
+          }
+          own_diff "$prev" > "$t/a.json" || review "$why; the change at ${prev:0:8} cannot be compared"
+          own_diff "$SHA"  > "$t/b.json" || review "$why; the change at ${SHA:0:8} cannot be compared"
+          # CI, lockfiles and the reviewer's own caller are never carried. A
+          # lockfile's diff can match while what it resolves to does not, and a
+          # workflow is the change that most needs a review on every push.
+          while IFS= read -r p; do
+            case "$p" in
+              .github/*) full "$p is under .github; never carried" ;;
+              */package-lock.json|package-lock.json|*/npm-shrinkwrap.json|npm-shrinkwrap.json|\
+              */pnpm-lock.yaml|pnpm-lock.yaml|*/yarn.lock|yarn.lock|*/bun.lock|bun.lock|*/bun.lockb|bun.lockb|\
+              */uv.lock|uv.lock|*/poetry.lock|poetry.lock|*/Pipfile.lock|Pipfile.lock|*/go.sum|go.sum|\
+              */Cargo.lock|Cargo.lock|*/Gemfile.lock|Gemfile.lock|*/composer.lock|composer.lock)
+                full "$p is a lockfile; never carried" ;;
+            esac
+          done < <(jq -s -r 'add | keys[]' "$t/a.json" "$t/b.json")
+          changed="$(jq -n -r --slurpfile a "$t/a.json" --slurpfile b "$t/b.json" '
+              ($a[0] + $b[0] | keys) | map(select($a[0][.] != $b[0][.])) | .[]')"
+          if [ -n "$changed" ]; then
+            # Some files changed: re-read only those, and keep the review of
+            # ${prev} for the rest. post-review.sh enforces both halves — no
+            # new finding outside the scope, and every open critical outside
+            # it carried. More than half the files changed is a full review:
+            # the saving is small and the carried half is the stale half.
+            n="$(printf '%s\n' "$changed" | grep -c .)"
+            total="$(jq -r 'keys | length' "$t/b.json")"
+            list="$(printf '%s\n' "$changed" | head -5 | paste -sd, -)"
+            if [ $(( n * 2 )) -gt "$total" ]; then
+              review "$n of $total file(s) of this pull request's own change differ from ${prev:0:8}, more than half; the skill scopes the round ($list)"
+            fi
+            {
+              printf 'scope_from=%s\n' "$prev"
+              printf 'scope_total=%s\n' "$total"
+              d="LINDAMAR_$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+              printf 'scope<<%s\n%s\n%s\n' "$d" "$changed" "$d"
+            } >> "$GITHUB_OUTPUT"
+            review "subset: $n of $total file(s) changed since ${prev:0:8}, $(( total - n )) carried ($list)"
+          fi
+          # The approval, too, but only after a clean verdict and only when
+          # every commit the branch gained since then is a merge: the head
+          # moved because base came in, and for no other reason. Anything that
+          # cannot be read leaves the approval to the next full review.
+          approve=false
+          if [ "$verdict" = "APPROVED" ]; then
+            own="$(gh api --paginate "repos/$REPO/compare/$BASE_SHA...$SHA" 2>/dev/null \
+                   | jq -s -r '[ .[] | (.commits // [])[] | .sha ] | unique | .[]' 2>/dev/null || true)"
+            # "ahead": the new head contains the old one, so history was not
+            # rewritten. The branch's own commits since then are the ones in
+            # both prev..head and merge-base..head; each must be a merge.
+            if [ -n "$own" ] && gh api --paginate "repos/$REPO/compare/$prev...$SHA" 2>/dev/null \
+                 | jq -s -e --arg own "$own" '
+                     ($own | split("\n")) as $own
+                     | length > 0 and all(.[]; type == "object" and .status == "ahead")
+                       and ([ .[] | (.commits // [])[] | select(.sha as $s | $own | index($s)) ]
+                            | length > 0 and all(.[]; (.parents | length) > 1))' >/dev/null 2>&1; then
+              approve=true
+            fi
+          fi
+          {
+            printf 'carried_from=%s\n' "$prev"
+            printf 'carried_verdict=%s\n' "$verdict"
+            printf 'carry_approve=%s\n' "$approve"
+          } >> "$GITHUB_OUTPUT"
+          skip carried "no change to this pull request's own diff since ${prev:0:8}; verdict $verdict carried from that review (approval carried: $approve)"
+
+      - name: Check the credential before spending anything
+        if: steps.triage.outputs.skip == ''
+        env:
+          CRED: ${{ inputs.claude-credential }}
+          API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OAUTH: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          case "$CRED" in
+            api-key)
+              if [ -z "$API_KEY" ]; then
+                echo "::error title=Missing ANTHROPIC_API_KEY::This repo has no ANTHROPIC_API_KEY secret. Add it in Settings → Secrets and variables → Actions. It is set per repo on purpose, so this repo's review cost bills to its own key."
+                exit 1
+              fi ;;
+            subscription)
+              if [ -z "$OAUTH" ]; then
+                echo "::error title=Missing CLAUDE_CODE_OAUTH_TOKEN::claude-credential is 'subscription' but no token is set."
+                exit 1
+              fi
+              echo "::warning title=Subscription credential in CI::A subscription token is an individual's own credential and bills to them. Any workflow in this repo can read it. api-key with a spend cap is the right credential for CI." ;;
+            *)
+              echo "::error title=Unknown credential mode::claude-credential must be 'api-key' or 'subscription', got '$CRED'."
+              exit 1 ;;
+          esac
+
+      # A hand-started review with a verdict already on this exact commit has
+      # nothing to do. Exiting here costs seconds and no tokens, which is what
+      # makes the retry safe to be dumb: it no longer has to work out whether a
+      # review already landed or is running, and the two guards that did — each
+      # an API call that could fail open — are deleted rather than hardened.
+      #
+      # Only on the hand-started path. A pull_request event means the commit
+      # changed or the author asked again, and re-reviewing is the point.
+      #
+      # ONE EXCEPTION: a PERSON asking again about a commit whose last verdict
+      # BLOCKS. That is the only way to have a blocked commit ruled on again
+      # without a push, and a push does not do it either: an empty commit leaves
+      # the pull request's own diff alone, so triage carries the red verdict
+      # (an earlier incident: "already has a verdict on <sha>").
+      # Such a run is a round like any other: its review on this commit is the
+      # newest, the gate reads it, and the budget counts it. It re-rules from the
+      # last review on an EARLIER commit, exactly as the round that blocked did
+      # — prior-findings.sh and post-review.sh never read a review on the head
+      # as the previous round — so the model can rule a carried finding fixed
+      # (resolved.json) against the files changed since it was first reported.
+      #
+      # Who is a person, from what GitHub sets and nothing the caller passes:
+      # the run's event is workflow_dispatch, `github.actor` and
+      # `github.triggering_actor` are both logins that are not `*[bot]` or
+      # `github-actions`, and the dispatch's sender is a `User`. In a reusable
+      # workflow these are the caller's own context; `with:` cannot set them.
+      # Measured on 2026-10-15: every console dispatch (the App
+      # token) shows `lindamar-reviewer[bot]` (Bot) for both actors. The retry
+      # dispatches with GITHUB_TOKEN, which GitHub records as
+      # `github-actions[bot]`; no such run exists yet to measure, so that login
+      # and the sender type are each enough to make it a bot. A human re-running
+      # a bot's run keeps the bot as `github.actor` and is a bot too: start a
+      # new run from Actions instead.
+      # Every bot, retry included, still stops here on any verdict, so the
+      # retry cannot loop, and a forged block can only change whether one
+      # person's dispatch spends — the gate trusts only a block that verifies.
+      - name: Stop early if this commit already has a verdict
+        id: already
+        if: steps.pr.outputs.dispatched == 'true' && steps.triage.outputs.skip == ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ steps.pr.outputs.number }}
+          SHA: ${{ steps.pr.outputs.sha }}
+          EVENT: ${{ github.event_name }}
+          ACTOR: ${{ github.actor }}
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+          SENDER_TYPE: ${{ github.event.sender.type }}
+        run: |
+          set -uo pipefail
+          person() { case "$1" in ''|*'[bot]'|github-actions) return 1 ;; esac; return 0; }
+          human=false
+          if [ "${EVENT:-}" = "workflow_dispatch" ] && person "${ACTOR:-}" && person "${TRIGGERING_ACTOR:-}" \
+             && [ "${SENDER_TYPE:-}" = "User" ]; then
+            human=true
+          fi
+          revs="$(gh api --paginate "repos/$REPO/pulls/$PR/reviews" 2>/dev/null || true)"
+          # `gh api` prints its error body to stdout, so a non-empty answer is not
+          # a successful one. An unreadable answer means carry on and review:
+          # spending a review is the safe direction here, unlike in the retry.
+          if ! printf '%s' "$revs" | jq -s -e 'all(.[]; type == "array")' >/dev/null 2>&1; then
+            echo "  cannot read existing reviews; going ahead with the review"
+            exit 0
+          fi
+          # The reviewer's signed-looking reviews of this commit, oldest first,
+          # and the critical count the newest one's block gates on. This job has
+          # no key, so "signed" means only that a signature is present.
+          # One line, "<count> <critical|unknown>". Not `read < <(...)`: under the
+          # runner's `bash -e` a read that meets an empty answer ends the step.
+          got="$(printf '%s' "$revs" | jq -s -r --arg sha "$SHA" \
+                '[ (add // [])[]
+                   | select(.user.login == "github-actions[bot]")
+                   | select((.body // "") | contains("Lindamar Code Review Result"))
+                   | select((.body // "") | test("<!-- lindamar-findings\n[^\n]*\"sig\":\\{\"v\":1"))
+                   | select(.commit_id == $sha) ]
+                 | [ length,
+                     (last // {} | (.body // "") | split("\n<!-- lindamar-findings\n")
+                      | if length < 2 then null else (last | split("\n-->") | .[0] | (try fromjson catch null)) end
+                      | if type == "object" and (.gate.critical | type) == "number" then .gate.critical else "unknown" end) ]
+                 | map(tostring) | join(" ")' 2>/dev/null || true)"
+          n="${got%% *}"; crit="${got#* }"
+          case "${n:-}" in ''|*[!0-9]*) echo "  could not count; going ahead"; exit 0 ;; esac
+          [ "$n" -gt 0 ] || exit 0
+          if [ "$human" = true ] && [ "${crit:-unknown}" != "0" ]; then
+            echo "  $REPO#$PR: the verdict on $SHA blocks (critical: ${crit:-unknown}) and $ACTOR started this run by hand — ruling on it again. This is a paid round and counts toward max-auto-rounds."
+            exit 0
+          fi
+          echo "skip=true" >> "$GITHUB_OUTPUT"
+          if [ "$human" = true ]; then
+            echo "  $REPO#$PR already has a verdict on $SHA that does not block — nothing to rule on again, and nothing spent."
+          else
+            echo "  $REPO#$PR already has a verdict on $SHA — nothing to do, and nothing spent. Started by ${TRIGGERING_ACTOR:-${ACTOR:-?}} (${EVENT:-?}, sender ${SENDER_TYPE:-?}), which is not a person; only a person's dispatch re-rules a blocked commit."
+          fi
+
+      - name: Get a reviewer read token from Checkmate
+        if: steps.already.outputs.skip != 'true' && steps.triage.outputs.skip == ''
+        id: app
+        env:
+          CHECKMATE_URL: ${{ inputs.checkmate-url }}
+          WANT: '["reviewer"]'
+        run: |
+          # Needed to check out the reviewer repo, which is private: a repo's own
+          # GITHUB_TOKEN cannot read a different private repo.
+          # OIDC token for audience = checkmate-url, exchanged at the tenant for
+          # a read token on the reviewer repo only. Neither token is printed;
+          # a refusal names the HTTP status and never the response body.
+          set -euo pipefail
+          url="${CHECKMATE_URL%/}"
+          case "$url" in https://?*) ;; *) echo "::error title=checkmate-url is not an https URL::Set the checkmate-url input to your Checkmate console URL."; exit 1 ;; esac
+          if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+            echo "::error title=No OIDC token available::The job that calls this workflow must grant \`permissions: id-token: write\`. A reusable workflow cannot grant it to itself."
+            exit 1
+          fi
+          aud="$(jq -rn --arg a "$url" '$a | @uri')"
+          oidc="$(curl -sS -f -m 30 -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+                    "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$aud" 2>/dev/null | jq -r '.value // empty' 2>/dev/null)" || oidc=""
+          [ -n "$oidc" ] || { echo "::error title=Could not get an OIDC token::GitHub did not issue an ID token for this job."; exit 1; }
+          echo "::add-mask::$oidc"
+          resp="$(mktemp)"; chmod 600 "$resp"
+          code="$(curl -sS -m 30 -o "$resp" -w '%{http_code}' -X POST \
+                    -H "Authorization: Bearer $oidc" -H "Content-Type: application/json" \
+                    -d "{\"tokens\":$WANT}" "$url/v1/actions/token" 2>/dev/null)" || code="000"
+          unset oidc
+          if [ "$code" != "200" ]; then
+            rm -f "$resp"
+            case "$code" in
+              401) why="the OIDC token was not accepted" ;;
+              403) why="this repository or workflow ref is not allowed for this tenant" ;;
+              503) why="the tenant cannot issue tokens right now; retry later" ;;
+              *)   why="unexpected answer" ;;
+            esac
+            echo "::error title=Checkmate refused the token request (HTTP $code)::$why. Response body not shown."
+            exit 1
+          fi
+          tok="$(jq -r '.token // empty' "$resp" 2>/dev/null || true)"
+          rtok="$(jq -r '.reviewer_token // empty' "$resp" 2>/dev/null || true)"
+          rm -f "$resp"
+          [ -z "$tok" ] || echo "::add-mask::$tok"
+          [ -z "$rtok" ] || echo "::add-mask::$rtok"
+          [ -n "$rtok" ] || { echo "::error title=No reviewer token::Checkmate answered 200 without a reviewer_token."; exit 1; }
+          echo "token=$rtok" >> "$GITHUB_OUTPUT"
+
+      - name: Check out the reviewer
+        if: steps.already.outputs.skip != 'true' && steps.triage.outputs.skip == ''
+        uses: actions/checkout@v4
+        with:
+          repository: Cincinnati-Associates/lindamar-reviewer
+          ref: ${{ inputs.reviewer-ref }}
+          token: ${{ steps.app.outputs.token }}
+          path: .lindamar-reviewer
+          # Otherwise the token is written into .git/config and stays readable on
+          # disk for the whole job, including the step that reads attacker-
+          # influenceable text. Nothing after this needs to talk to git.
+          persist-credentials: false
+
+      - name: Revoke the installation token now that the checkout is done
+        if: steps.already.outputs.skip != 'true' && steps.triage.outputs.skip == ''
+        env:
+          TOK: ${{ steps.app.outputs.token }}
+        run: |
+          # Revoked here, not at the end of the job: it is valid for up to an
+          # hour, and the review step
+          # after this one reads untrusted diff content. Nothing past the
+          # checkout needs it.
+          [ -n "$TOK" ] || exit 0
+          code=$(curl -sS -o /dev/null -w '%{http_code}' -X DELETE \
+            -H "Authorization: Bearer $TOK" -H "Accept: application/vnd.github+json" \
+            https://api.github.com/installation/token || echo "000")
+          echo "revoke returned HTTP $code"
+
+      - uses: actions/setup-node@v4
+        if: steps.already.outputs.skip != 'true' && steps.triage.outputs.skip == ''
+        with:
+          node-version: "22"
+
+      - name: Install the reviewer's skills, and verify the count
+        if: steps.already.outputs.skip != 'true' && steps.triage.outputs.skip == ''
+        working-directory: .lindamar-reviewer
+        run: |
+          # This is the step a fresh checkout exists to break. install-skills.sh
+          # used to print "Skills ready" over whatever happened to land, and a
+          # clean clone got four of eleven silently — the machine it was developed
+          # on had the rest placed by hand six weeks earlier. It now verifies the
+          # installed set against the lock plus config/authored-skills.json and
+          # exits non-zero, so a review never runs backed by fewer rule
+          # catalogues than it names.
+          npm install --no-audit --no-fund
+          # install-skills.sh distinguishes its two failures on purpose: 1 means a
+          # community skill did not come over the network, 2 means an authored
+          # skill is missing from the tree. Running it bare treated both the same
+          # — the distinction was built and then not used, which the reviewer
+          # caught on its own source. A transient fetch is worth one retry; a
+          # broken tree is not.
+          set +e
+          sh scripts/install-skills.sh; rc=$?
+          if [ "$rc" -eq 1 ]; then
+            echo "::warning title=Retrying community skills::A community skill did not restore; retrying once before failing."
+            sleep 10
+            sh scripts/install-skills.sh; rc=$?
+          fi
+          set -e
+          if [ "$rc" -eq 2 ]; then
+            echo "::error title=Reviewer tree is incomplete::An authored skill is missing from the reviewer checkout, so a review would run backed by fewer rule catalogues than it names. This is not a network problem."
+            exit 2
+          fi
+          [ "$rc" -eq 0 ] || { echo "::error title=Skills incomplete after retry::See the count above."; exit "$rc"; }
+        env:
+          npm_config_yes: "true"
+
+      - name: Install the Claude CLI
+        if: steps.already.outputs.skip != 'true' && steps.triage.outputs.skip == ''
+        run: |
+          npm install -g "@anthropic-ai/claude-code@${LINDAMAR_CLAUDE_CLI_VERSION}"
+          claude --version
+
+      - name: Say in Slack that a review started
+        if: always() && steps.already.outputs.skip != 'true' && steps.triage.outputs.skip == ''
+        id: slackstart
+        env:
+          BOT: ${{ secrets.LINDAMAR_SLACK_BOT_TOKEN }}
+          CH: ${{ secrets.LINDAMAR_SLACK_CHANNEL }}
+          REPO: ${{ github.repository }}
+          PR: ${{ steps.pr.outputs.number }}
+          TITLE: ${{ steps.pr.outputs.title }}
+          URL: ${{ steps.pr.outputs.url }}
+        run: |
+          # Only with a bot token. A webhook cannot edit what it posted, so on
+          # that path a "started" notice would just double the channel's volume.
+          [ -n "${BOT:-}" ] && [ -n "${CH:-}" ] || exit 0
+          txt=":mag: *<$URL|$REPO #$PR>* — reviewing…"$'\n'"$(printf '%.90s' "$TITLE")"
+          ts=$(curl -sS -m 15 -X POST -H "Authorization: Bearer $BOT" \
+            -H 'Content-type: application/json' \
+            -d "$(jq -n --arg c "$CH" --arg t "$txt" '{channel:$c, text:$t}')" \
+            https://slack.com/api/chat.postMessage | jq -r '.ts // empty')
+          [ -n "$ts" ] && echo "ts=$ts" >> "$GITHUB_OUTPUT" && echo "posted $ts"
+
+      - name: Review
+        if: steps.already.outputs.skip != 'true' && steps.triage.outputs.skip == ''
+        id: review
+        working-directory: .lindamar-reviewer
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ANTHROPIC_API_KEY: ${{ inputs.claude-credential == 'api-key' && secrets.ANTHROPIC_API_KEY || '' }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ inputs.claude-credential == 'subscription' && secrets.CLAUDE_CODE_OAUTH_TOKEN || '' }}
+          LINDAMAR_PR_URL: ${{ steps.pr.outputs.url }}
+          LINDAMAR_REVIEW_SHA: ${{ steps.pr.outputs.sha }}
+          LINDAMAR_VERDICT_MODE: ${{ inputs.verdict-mode }}
+          LINDAMAR_MODEL: ${{ inputs.model }}
+          # Wait for every sub-agent. The orchestrator launches its reviewers in
+          # the background and can end its turn while one is still working; in
+          # print mode the CLI then waits 10 minutes and kills it, the run ends
+          # "success", nothing is posted, and the gate goes red with "no review
+          # for this commit" (lindamar-reviewer#72 at e54e5b9: $6.19 spent, the
+          # shell reviewer stopped mid-review). 0 waits without a ceiling; the
+          # job's timeout-minutes still bounds the whole run.
+          CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS: "0"
+          # The agent writes its review here and does not post it. GH_TOKEN above
+          # is this job's, and this job can only read.
+          LINDAMAR_HANDOFF_DIR: ${{ runner.temp }}/handoff
+          # A file list from triage makes this a subset round, and `full` is a
+          # safety case. Empty leaves the scope to the skill, as before.
+          LINDAMAR_SCOPE: ${{ steps.triage.outputs.scope }}
+          LINDAMAR_SCOPE_FROM: ${{ steps.triage.outputs.scope_from }}
+        run: |
+          set -uo pipefail
+          mkdir -p "$RUNNER_TEMP/state"
+          export LINDAMAR_STATE_DIR="$RUNNER_TEMP/state"
+          # `|| rc=$?`, not a bare call followed by `rc=$?`. GitHub runs a `run:`
+          # block under `bash -e`, so a failing CLI aborted the step on that very
+          # line and every line below — the ones that exist to say WHY it failed —
+          # was unreachable. The only time the diagnostics ran was when there was
+          # nothing to diagnose. A review that burned 18 minutes and $4.70 and
+          # exited 1 reported nothing at all, which is how this was found.
+          rc=0
+          # The runner's file commands are not the agent's to use: through them
+          # it could set this step's outputs or later steps' env. The paths are
+          # still guessable, so the post job also validates every agent output
+          # it reads; this only removes the obvious door.
+          env -u GITHUB_OUTPUT -u GITHUB_ENV -u GITHUB_PATH -u GITHUB_STEP_SUMMARY -u GITHUB_STATE \
+              -u ACTIONS_ID_TOKEN_REQUEST_URL -u ACTIONS_ID_TOKEN_REQUEST_TOKEN \
+          claude -p "/lindamar-review-pr $LINDAMAR_PR_URL" \
+            --model "${LINDAMAR_MODEL:-claude-opus-5}" \
+            --output-format stream-json --verbose \
+            --dangerously-skip-permissions \
+            </dev/null > "$RUNNER_TEMP/stream.jsonl" 2>"$RUNNER_TEMP/stream.err" || rc=$?
+          jq -r 'select(.type=="assistant") | .message.content[]? | select(.type=="text") | .text' \
+            "$RUNNER_TEMP/stream.jsonl" 2>/dev/null | tail -c 8000 || true
+          if [ -s "$RUNNER_TEMP/stream.err" ]; then
+            echo "--- stderr from the CLI ---"; tail -c 2000 "$RUNNER_TEMP/stream.err"
+          fi
+          # The stream's own last word on how it ended, which is often the only
+          # place a limit or a turn cap is named.
+          jq -r 'select(.type=="result")
+                 | "--- result: subtype=\(.subtype // "?") is_error=\(.is_error // false) ---"
+                   + (if (.result // "") != "" then "\n" + ((.result|tostring)[0:1500]) else "" end)' \
+            "$RUNNER_TEMP/stream.jsonl" 2>/dev/null | tail -c 2000 || true
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          if [ "$rc" -ne 0 ]; then
+            # Say WHY it could not review. "The reviewer found problems" and "the
+            # reviewer never ran" had the same red check and the same wording,
+            # and the second one is not the author's to fix.
+            #
+            # Classified on SHAPE first, wording second. Both failures seen so far
+            # had one turn, zero output tokens and zero cost — what "started and
+            # did no work at all" looks like whatever the message says. Wording
+            # changes between releases; that shape does not.
+            turns="$(jq -s -r '[.[] | select(.type=="result")] | last | (.num_turns // 0)' "$RUNNER_TEMP/stream.jsonl" 2>/dev/null || echo 0)"
+            outtok="$(jq -s -r '[.[] | select(.type=="assistant") | .message.usage.output_tokens // 0] | add // 0' "$RUNNER_TEMP/stream.jsonl" 2>/dev/null || echo 0)"
+            # The CLI's stderr, plus the result text ONLY when the result is
+            # flagged as an error. A successful review's own prose is full of
+            # the words this matches on — a security review says
+            # "authentication" and "unauthorized" constantly — and classifying
+            # on it would tell an author their credential was refused because
+            # the reviewer did its job.
+            # `|| true`. `set -o pipefail` is on, so an unparseable stream makes jq
+            # fail, the pipeline fail, the assignment fail, and `bash -e` end the
+            # step — taking the notice with it, in precisely the case the notice
+            # exists to report. sh-205 for the third time in this branch, which is
+            # why check-workflows.sh now looks for the shape.
+            txt="$( { cat "$RUNNER_TEMP/stream.err" 2>/dev/null; \
+                      jq -r 'select(.type=="result") | select(.is_error == true) | ((.result // "") | tostring)' \
+                        "$RUNNER_TEMP/stream.jsonl" 2>/dev/null; } | tr 'A-Z' 'a-z' || true )"
+            blocked=""
+            case "$txt" in
+              *"usage limit"*|*usage_limit*|*"rate limit"*|*rate_limit*|*"spend limit"*|*"out of credit"*|*"credit balance"*|*quota*) blocked=usage ;;
+              *authentication*|*unauthorized*|*"invalid api key"*|*"invalid token"*|*oauth*) blocked=auth ;;
+            esac
+            if [ -z "$blocked" ] && [ "${turns:-0}" -le 1 ] && [ "${outtok:-0}" -eq 0 ]; then blocked=nowork; fi
+            echo "blocked=$blocked" >> "$GITHUB_OUTPUT"
+            # A reset time only if the CLI named one. Do not invent one.
+            reset="$(printf '%s' "$txt" | sed -nE 's/.*reset[^0-9]{0,24}([0-9]{1,2}:[0-9]{2}( ?[ap]m)?).*/\1/p' | head -1)"
+            [ -n "$reset" ] && echo "resetAt=$reset" >> "$GITHUB_OUTPUT"
+            case "$blocked" in
+              usage) echo "::error title=Out of usage, nothing was reviewed::The reviewer's credential has no usage left, so this pull request was not checked. This is not a finding and nothing here is the author's to fix. It retries by itself." ;;
+              auth)  echo "::error title=Credential rejected, nothing was reviewed::The reviewer's credential was refused. This pull request was not checked, and retrying will not help until the secret is replaced." ;;
+              nowork) echo "::error title=The reviewer did no work::It started, used no tokens and stopped on the first turn, so it never got as far as reading the diff. Its stderr and result event are above." ;;
+              *) echo "::error title=The reviewer exited $rc::The CLI ran and failed. Its stderr and result event are above. Nothing was posted, so the gate is red for that reason and not for a finding." ;;
+            esac
+            exit "$rc"
+          fi
+          # A run that exited 0 and handed nothing over reviewed nothing the post
+          # job can use. Saying so here keeps it from reading as a pass later.
+          for f in findings.json summary.md meta.json; do
+            if [ ! -s "$LINDAMAR_HANDOFF_DIR/$f" ]; then
+              echo "::error title=The agent handed nothing over::It exited 0 without writing $f to the handoff directory, so there is no review to post."
+              exit 1
+            fi
+          done
+          echo "ran=true" >> "$GITHUB_OUTPUT"
+
+      # The review, as data, for the post job. Retention is a day: it quotes
+      # findings about this repository's code and nothing needs it afterwards.
+      - uses: actions/upload-artifact@v4
+        if: steps.review.outputs.ran == 'true'
+        with:
+          name: lindamar-review-handoff-${{ steps.pr.outputs.number }}
+          path: ${{ runner.temp }}/handoff
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Record what it cost
+        id: cost
+        if: always() && steps.triage.outputs.skip == ''
+        env:
+          REPO: ${{ github.repository }}
+          PR: ${{ steps.pr.outputs.number }}
+          SHA: ${{ steps.pr.outputs.sha }}
+          CRED: ${{ inputs.claude-credential }}
+        run: |
+          # Cost per repo is the whole reason the API key is set per repo, so it
+          # has to be recorded per run rather than read off a console later. An
+          # incomplete run still spent money and is marked, not dropped.
+          S="$RUNNER_TEMP/stream.jsonl"
+          [ -s "$S" ] || { echo "no stream to cost"; exit 0; }
+          jq -cn --arg repo "$REPO" --arg pr "$PR" --arg sha "$SHA" --arg cred "$CRED" '
+            [inputs] as $ev
+            | ($ev | map(select(.type=="result")) | last) as $r
+            | ($ev | map(select(.type=="assistant") | .message.usage // empty)) as $u
+            | { repo:$repo, pr:($pr|tonumber), sha:$sha, credential:$cred,
+                complete: ($r != null),
+                costUsd: (if $r then $r.total_cost_usd else null end),
+                resultSubtype: (if $r then ($r.subtype // null) else null end),
+                isError: (if $r then ($r.is_error // false) else null end),
+                costBasis: (if $r then ([$r.modelUsage[]?.costBasis]|first) else null end),
+                outputTokens: (if $r then $r.usage.output_tokens else (($u|map(.output_tokens//0)|add)//0) end),
+                # Omitted from the first version of this, so "how many agents ran"
+                # was unanswerable from CI.
+                subagents: (if $r then $r.subagent_stats.spawned else null end),
+                turns: (if $r then $r.num_turns else null end),
+                durationMs: (if $r then $r.duration_api_ms else null end),
+                models: (if $r then ($r.modelUsage | keys) else [] end),
+                note: (if $r then null else "run did not finish; usage is a lower bound" end) }
+          ' "$S" > "$RUNNER_TEMP/cost.json"
+          cat "$RUNNER_TEMP/cost.json"
+          {
+            echo "### Review cost"
+            echo ""
+            jq -r '"- repo: `\(.repo)` PR #\(.pr)\n- credential: `\(.credential)`\n- cost: \(if .costUsd then "$" + (.costUsd|tostring) + " (basis: " + (.costBasis // "?") + ")" else "not recorded — the run did not finish, so this is **not** free" end)\n- output tokens: \(.outputTokens)\n- agents: \(.subagents // "?")  turns: \(.turns // "?")"' \
+              "$RUNNER_TEMP/cost.json"
+          } >> "$GITHUB_STEP_SUMMARY"
+          # For the Slack line, which the post job writes.
+          echo "cost=$(jq -r 'if .costUsd then "$" + ((.costUsd*100|round/100)|tostring) else "not recorded" end' "$RUNNER_TEMP/cost.json" 2>/dev/null || echo "not recorded")" >> "$GITHUB_OUTPUT"
+
+      # The raw transcript is NOT uploaded. It quotes the diff, so in a client
+      # repo it is that client's source, and a review that finds a committed
+      # secret quotes enough to identify it. This project already expires those
+      # logs on the developer machine under data minimisation, and then this step
+      # published them unredacted to a downloadable artifact with a week's
+      # retention. Reported as sec-703 against this workflow, correctly.
+      #
+      # cost.json carries no diff content: repo, PR number, sha, credential mode,
+      # token counts and a dollar figure.
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.triage.outputs.skip == ''
+        with:
+          name: lindamar-review-cost-${{ steps.pr.outputs.number }}
+          path: ${{ runner.temp }}/cost.json
+          retention-days: 7
+          if-no-files-found: ignore
+
+      # Opt-in, for debugging a run that went wrong. Turning it on publishes diff
+      # content to anyone who can read the repo's artifacts, so it is off by
+      # default and named for what it does.
+      - uses: actions/upload-artifact@v4
+        if: always() && inputs.upload-transcript && steps.triage.outputs.skip == ''
+        with:
+          name: lindamar-review-transcript-${{ steps.pr.outputs.number }}
+          path: |
+            ${{ runner.temp }}/stream.jsonl
+            ${{ runner.temp }}/stream.err
+          retention-days: 1
+          if-no-files-found: ignore
+
+
+  # The only job that writes. It runs no model, and the agent's output reaches it
+  # as a file it validates and treats as data, never as instructions. Its name is
+  # the required check: `review / Lindamar review`.
+  #
+  # `always()`, and never anything that can evaluate to false. This job IS the
+  # required check, and a required check whose job is SKIPPED reports success
+  # to branch protection: with `!cancelled()` here, cancelling the run passed
+  # the check with no review behind it (sec-104). So it always runs; on a
+  # cancelled run the gate fails it, and the withdraw step stays out of it, so a
+  # push that cancelled this run cannot also strip an approval the newer run is
+  # about to decide on. scripts/test-review-split.sh pins this condition.
+  review:
+    name: Lindamar review
+    needs: agent
+    if: always()
+    runs-on: ubuntu-latest
+    outputs:
+      gate: ${{ steps.gate.outcome }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      # Only to fetch the OIDC token exchanged for the reviewer read token.
+      id-token: write
+      # Still NOT statuses: write. The hand-started path's status is written by
+      # carry-verdict below, which holds that scope and nothing else.
+
+    steps:
+      # The signing key, derived and never the configured secret itself: HKDF
+      # with an info string that names the key version, so the secret cannot sign
+      # anything else and a rotation is a version bump. No secret, no signing —
+      # and then nothing is ever carried between rounds: the agent job reads only
+      # signed blocks, so it finds none and reviews in full, and this job says so.
+      - name: Derive the findings signing key
+        id: key
+        env:
+          IKM: ${{ secrets.LINDAMAR_FINDINGS_KEY }}
+        run: |
+          set -uo pipefail
+          if [ -z "${IKM:-}" ]; then
+            echo "signing=off" >> "$GITHUB_OUTPUT"
+            echo "::warning title=No findings signing key::LINDAMAR_FINDINGS_KEY is not passed to this workflow, so reviews are not signed and no verdict or finding is carried between rounds: every push is a full review."
+            exit 0
+          fi
+          # Inline rather than from the reviewer checkout: this step runs before
+          # it, and the derivation is short enough to read here in full.
+          key="$(LINDAMAR_FINDINGS_IKM="$IKM" python3 -c '
+          import hashlib, hmac, os
+          ikm = os.environ["LINDAMAR_FINDINGS_IKM"].encode()
+          prk = hmac.new(b"\0" * 32, ikm, hashlib.sha256).digest()
+          print(hmac.new(prk, b"lindamar-review-findings-v1" + b"\x01", hashlib.sha256).hexdigest())
+          ')"
+          [ "${#key}" -eq 64 ] || { echo "::error title=Could not derive the signing key::"; exit 1; }
+          echo "::add-mask::$key"
+          echo "LINDAMAR_FINDINGS_KEY=$key" >> "$GITHUB_ENV"
+          echo "signing=on" >> "$GITHUB_OUTPUT"
+
+      - name: Get a reviewer read token from Checkmate
+        if: needs.agent.outputs.skip == '' || needs.agent.outputs.skip == 'carried'
+        id: app
+        env:
+          CHECKMATE_URL: ${{ inputs.checkmate-url }}
+          WANT: '["reviewer"]'
+        run: |
+          # This job needs the reviewer's scripts (post-review.sh, the signature
+          # check), not its skills.
+          # OIDC token for audience = checkmate-url, exchanged at the tenant for
+          # a read token on the reviewer repo only. Neither token is printed;
+          # a refusal names the HTTP status and never the response body.
+          set -euo pipefail
+          url="${CHECKMATE_URL%/}"
+          case "$url" in https://?*) ;; *) echo "::error title=checkmate-url is not an https URL::Set the checkmate-url input to your Checkmate console URL."; exit 1 ;; esac
+          if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+            echo "::error title=No OIDC token available::The job that calls this workflow must grant \`permissions: id-token: write\`. A reusable workflow cannot grant it to itself."
+            exit 1
+          fi
+          aud="$(jq -rn --arg a "$url" '$a | @uri')"
+          oidc="$(curl -sS -f -m 30 -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+                    "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$aud" 2>/dev/null | jq -r '.value // empty' 2>/dev/null)" || oidc=""
+          [ -n "$oidc" ] || { echo "::error title=Could not get an OIDC token::GitHub did not issue an ID token for this job."; exit 1; }
+          echo "::add-mask::$oidc"
+          resp="$(mktemp)"; chmod 600 "$resp"
+          code="$(curl -sS -m 30 -o "$resp" -w '%{http_code}' -X POST \
+                    -H "Authorization: Bearer $oidc" -H "Content-Type: application/json" \
+                    -d "{\"tokens\":$WANT}" "$url/v1/actions/token" 2>/dev/null)" || code="000"
+          unset oidc
+          if [ "$code" != "200" ]; then
+            rm -f "$resp"
+            case "$code" in
+              401) why="the OIDC token was not accepted" ;;
+              403) why="this repository or workflow ref is not allowed for this tenant" ;;
+              503) why="the tenant cannot issue tokens right now; retry later" ;;
+              *)   why="unexpected answer" ;;
+            esac
+            echo "::error title=Checkmate refused the token request (HTTP $code)::$why. Response body not shown."
+            exit 1
+          fi
+          tok="$(jq -r '.token // empty' "$resp" 2>/dev/null || true)"
+          rtok="$(jq -r '.reviewer_token // empty' "$resp" 2>/dev/null || true)"
+          rm -f "$resp"
+          [ -z "$tok" ] || echo "::add-mask::$tok"
+          [ -z "$rtok" ] || echo "::add-mask::$rtok"
+          [ -n "$rtok" ] || { echo "::error title=No reviewer token::Checkmate answered 200 without a reviewer_token."; exit 1; }
+          echo "token=$rtok" >> "$GITHUB_OUTPUT"
+
+      - name: Check out the reviewer
+        if: steps.app.outputs.token != ''
+        uses: actions/checkout@v4
+        with:
+          repository: Cincinnati-Associates/lindamar-reviewer
+          ref: ${{ inputs.reviewer-ref }}
+          token: ${{ steps.app.outputs.token }}
+          path: .lindamar-reviewer
+          persist-credentials: false
+
+      - name: Revoke the installation token now that the checkout is done
+        if: steps.app.outputs.token != ''
+        env:
+          TOK: ${{ steps.app.outputs.token }}
+        run: |
+          code=$(curl -sS -o /dev/null -w '%{http_code}' -X DELETE \
+            -H "Authorization: Bearer $TOK" -H "Accept: application/vnd.github+json" \
+            https://api.github.com/installation/token || echo "000")
+          echo "revoke returned HTTP $code"
+
+      - uses: actions/download-artifact@v4
+        if: needs.agent.outputs.ran == 'true'
+        with:
+          name: lindamar-review-handoff-${{ needs.agent.outputs.number }}
+          path: ${{ runner.temp }}/handoff
+
+      # The agent's output is untrusted: it was written by a model that read text
+      # anyone can put in a diff. It is checked for shape and stripped to the
+      # fields a finding may carry — a planted `preExisting` or `carriedFrom`
+      # would change how a finding blocks — and only then handed to
+      # post-review.sh, which treats it as data. What was left open before is
+      # NOT taken from the agent: it is re-read here, with the key.
+      - name: Post the review
+        id: post
+        if: needs.agent.outputs.ran == 'true'
+        working-directory: .lindamar-reviewer
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ needs.agent.outputs.number }}
+          LINDAMAR_REVIEW_SHA: ${{ needs.agent.outputs.sha }}
+          LINDAMAR_VERDICT_MODE: ${{ inputs.verdict-mode }}
+          SIGNING: ${{ steps.key.outputs.signing }}
+          H: ${{ runner.temp }}/handoff
+          # Triage's scope, from the agent job's outputs and not from the
+          # agent's handoff: post-review.sh enforces it (no finding outside
+          # it, every open critical outside it carried).
+          LINDAMAR_SCOPE: ${{ needs.agent.outputs.scope }}
+          LINDAMAR_SCOPE_FROM: ${{ needs.agent.outputs.scope_from }}
+        run: |
+          set -uo pipefail
+          bad() { echo "::error title=The agent's review did not validate::$1. Nothing was posted."; exit 1; }
+          for f in findings.json summary.md meta.json; do [ -s "$H/$f" ] || bad "$f is missing"; done
+          [ "$(wc -c < "$H/summary.md")" -le 60000 ] || bad "summary.md is over 60000 bytes"
+          verdict="$(jq -r 'if (.verdict | IN("APPROVED","REJECTED","COMMENT")) then .verdict else empty end' "$H/meta.json" 2>/dev/null)"
+          [ -n "$verdict" ] || bad "meta.json names no verdict"
+          agent_prev="$(jq -r 'if (.prevSha | type) == "string" and (.prevSha | test("^([0-9a-f]{40})?$")) then .prevSha else "BAD" end' "$H/meta.json" 2>/dev/null)"
+          [ "$agent_prev" != "BAD" ] || bad "meta.json's prevSha is not a commit"
+          jq -e 'type == "array" and length <= 500 and all(.[];
+                   type == "object"
+                   and (.path | type == "string" and length > 0 and length <= 1000 and (test("[\n\r]") | not))
+                   and ((.line // 0) | (type == "number") or (type == "string" and test("^[0-9]+$")))
+                   and ((.severity // "") | type == "string" and length <= 32)
+                   and ((.rule // "") | type == "string" and test("^[A-Za-z0-9_.:-]{0,64}$"))
+                   and ([.title, .body, .suggestion, .fixPrompt, .rootCause, .alsoCheck, .verifyBeforePush] | all(. == null or (type == "string" and length <= 20000))))' \
+            "$H/findings.json" >/dev/null 2>&1 || bad "findings.json is not a list of findings"
+          jq '[ .[] | {path, line, severity, rule, title, body, suggestion, fixPrompt, sweptFiles, rootCause, alsoCheck, verifyBeforePush}
+                    | with_entries(select(.value != null)) ]' "$H/findings.json" > "$RUNNER_TEMP/findings.json" \
+            || bad "findings.json could not be normalised"
+          extra=()
+          # Earlier findings the model ruled fixed in another file (optional;
+          # added after an earlier incident). Untrusted like the rest: bounded in size, and
+          # reduced by lib/resolved-prior.jq to the six fields an entry may
+          # carry, each type- and length-checked, the evidence cleaned to one
+          # inert line. An entry that fails becomes {"malformed": <fixed reason>}
+          # and resolves nothing; a file that fails as a whole resolves nothing.
+          # Either way the review still posts and those findings carry, because
+          # a refused ruling can only over-block, and post-review.sh says so on
+          # the page. Whether a ruling is believed is post-review.sh's call,
+          # against the previous round read here with the key, never the agent's.
+          if [ -e "$H/resolved.json" ]; then
+            if [ -f "$H/resolved.json" ] && [ "$(wc -c < "$H/resolved.json")" -le 200000 ] \
+               && jq -L scripts/lib 'include "resolved-prior"; normalise_resolved' "$H/resolved.json" > "$RUNNER_TEMP/resolved.json" 2>/dev/null; then
+              echo "  resolved-prior: $(jq '[.[] | select(has("malformed") | not)] | length' "$RUNNER_TEMP/resolved.json") well-formed ruling(s), $(jq '[.[] | select(has("malformed"))] | length' "$RUNNER_TEMP/resolved.json") malformed"
+            else
+              echo '[{"malformed":"unreadable"}]' > "$RUNNER_TEMP/resolved.json"
+              echo "::warning title=The agent's resolved-prior rulings did not validate::resolved.json is not a bounded JSON list; nothing it names is resolved, and those findings carry."
+            fi
+            extra+=(--resolved "$RUNNER_TEMP/resolved.json")
+          fi
+          for f in candidates verdicts; do
+            if [ -s "$H/$f.json" ] && [ "$(wc -c < "$H/$f.json")" -le 2000000 ] && jq -e 'type == "array" or type == "object"' "$H/$f.json" >/dev/null 2>&1; then
+              extra+=(--"$f" "$H/$f.json")
+            fi
+          done
+
+          # What the last round left open, read here and not from the agent.
+          prior=()
+          if [ "$SIGNING" = "on" ]; then
+            bash scripts/prior-findings.sh --repo "$REPO" --pr "$PR" --head "$LINDAMAR_REVIEW_SHA" > "$RUNNER_TEMP/prior.json" \
+              || { echo "::error title=Cannot read the previous round::What the last signed review left open could not be read, so nothing is posted rather than posting without it."; exit 1; }
+            prev="$(jq -r '.prevSha // ""' "$RUNNER_TEMP/prior.json")"
+            prior=(--prior "$RUNNER_TEMP/prior.json")
+            export LINDAMAR_REQUIRE_SIGNED=1
+          else
+            prev=""
+          fi
+          # The agent scoped its round against agent_prev. If that is not the
+          # review this job can verify, files between the two were neither
+          # reviewed nor carried — so nothing is posted, and the check stays red.
+          if [ "$agent_prev" != "$prev" ]; then
+            echo "::error title=The agent scoped against an unverified review::It reviewed what changed since ${agent_prev:-nothing} but the last review this job can verify is ${prev:-none}, so nothing was posted. Start the review again by hand (Actions → Lindamar review → Run workflow with PR number $PR); if the two disagree again, a review on this pull request is not what it claims to be — look at its reviews before going further."
+            exit 1
+          fi
+          echo "  previous round: ${prev:-none} (signing $SIGNING)"
+
+          export LINDAMAR_REVIEW_ID_OUT="$RUNNER_TEMP/review-id"
+          rc=0
+          bash scripts/post-review.sh --repo "$REPO" --pr "$PR" --verdict "$verdict" \
+            --findings "$RUNNER_TEMP/findings.json" --summary "$H/summary.md" \
+            ${extra[@]+"${extra[@]}"} ${prior[@]+"${prior[@]}"} || rc=$?
+          case "$rc" in
+            0) echo "review_id=$(cat "$RUNNER_TEMP/review-id" 2>/dev/null)" >> "$GITHUB_OUTPUT" ;;
+            3) echo "  nothing new to post; the gate reads the existing signed verdict" ;;
+            *) echo "::error title=Could not post the review::post-review.sh exited $rc."; exit "$rc" ;;
+          esac
+
+      - name: Gate on critical findings
+        id: gate
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FAIL_ON_CRITICAL: ${{ inputs.fail-on-critical }}
+          REVIEW_RAN: ${{ needs.agent.outputs.ran }}
+          SKIPPED: ${{ needs.agent.outputs.already }}
+          TRIAGE: ${{ needs.agent.outputs.skip }}
+          CARRIED_FROM: ${{ needs.agent.outputs.carried_from }}
+          ROUNDS: ${{ needs.agent.outputs.rounds }}
+          HEAD_SHA: ${{ needs.agent.outputs.sha }}
+          SCOPE: ${{ needs.agent.outputs.scope }}
+          SCOPE_FROM: ${{ needs.agent.outputs.scope_from }}
+          SCOPE_TOTAL: ${{ needs.agent.outputs.scope_total }}
+          REPO: ${{ github.repository }}
+          PR: ${{ needs.agent.outputs.number }}
+          REVIEW_ID: ${{ steps.post.outputs.review_id }}
+          SIGNING: ${{ steps.key.outputs.signing }}
+          SIG: ${{ github.workspace }}/.lindamar-reviewer/scripts/lib/findings_sig.py
+          JOB_STATUS: ${{ job.status }}
+          AGENT_RESULT: ${{ needs.agent.result }}
+        run: |
+          # Read the verdict from GitHub, not from the transcript. A run can print
+          # a confident summary and never have posted anything — that happened
+          # during a GitHub outage and a PR was recorded as reviewed when it was
+          # not. What is on the PR is what counts.
+          set -uo pipefail
+          # A cancelled run reviewed nothing. Red, never skipped and never green:
+          # a skipped required check counts as passed.
+          if [ "${JOB_STATUS:-}" = "cancelled" ] || [ "${AGENT_RESULT:-}" = "cancelled" ]; then
+            echo "::error title=The run was cancelled::Nothing was reviewed on \`${HEAD_SHA:-this commit}\`. A newer push starts its own review; otherwise start one by hand."
+            exit 1
+          fi
+          # The automatic budget is spent. Red, never a skip: nothing reviewed
+          # this commit. The check is the only place this is said — no comment,
+          # no Slack.
+          if [ "${TRIAGE:-}" = "capped" ]; then
+            n="${ROUNDS:-}"; case "$n" in ''|*[!0-9]*) n="?" ;; esac
+            msg="The automatic review budget for this pull request is used up ($n rounds). Fix all the findings in one push, then start a review of that commit by hand: Actions → Lindamar review → Run workflow with PR number ${PR:-?}, or from the console. It is never capped and counts as a round. To have a blocked commit ruled on again without a push (a finding fixed in another file, say), a person must start it from Actions: the console and the retry are bots, and a bot's run stops at any verdict already on the commit."
+            echo "::error title=Automatic review budget used up::$msg"
+            { echo "### automatic review budget used up"; echo ""; echo "$msg"; } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          # Triage decided no review was needed. Green, with the reason on the
+          # check, and nothing read from the pull request: there is no verdict
+          # to read, and demanding one here would fail every skip.
+          #
+          # Carried is the exception: a verdict exists, on the last commit the
+          # reviewer ruled on, and this push left the pull request's own diff
+          # identical to it. The gate reads THAT review and decides exactly as
+          # it would have on it, so a carried red stays red.
+          ruled_on="$HEAD_SHA"
+          if [ "${TRIAGE:-}" = "carried" ]; then
+            ruled_on="${CARRIED_FROM:-}"
+            msg="No change to this pull request's own diff since ${ruled_on:0:8}; verdict carried from that review. No model ran on \`$HEAD_SHA\`."
+            echo "::notice title=verdict carried from ${ruled_on:0:8}::$msg"
+            { echo "### verdict carried from \`${ruled_on:0:8}\`"; echo ""; echo "$msg"; } >> "$GITHUB_STEP_SUMMARY"
+          elif [ -n "${TRIAGE:-}" ]; then
+            case "$TRIAGE" in
+              docs)    why="docs only" ;;
+              install) why="pipeline install (config verified)" ;;
+              *)       why="$TRIAGE" ;;
+            esac
+            echo "::notice title=skipped: $why::No review ran on \`$HEAD_SHA\`, and none was needed. Nothing was spent. The rule is in review.yml, step \"Decide whether this pull request needs a review\"."
+            echo "### skipped: $why" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          # Filter on the commit the review ruled on. Without this the gate read the
+          # newest marker review regardless of sha: a stale CHANGES_REQUESTED from
+          # the previous commit kept the check red after the finding was fixed, so
+          # the gate could never clear itself — which is the whole property a
+          # no-human gate depends on.
+          # Piped to jq rather than using `gh api --jq`: that flag takes exactly one
+          # filter and rejects --arg, so the sha-filtered version added this morning
+          # errored on every call. stderr was redirected away, so the body came back
+          # empty and the gate reported "no review for this commit" — a constant
+          # fail that looked correct for a day because every PR it saw had criticals.
+          # A clean PR is what exposed it.
+          #
+          # Only the reviewer's own verdict counts (base-303, sec-104). Two ways to
+          # know a review is that:
+          #   - this job posted it, in this run: read back by the id post-review.sh
+          #     returned, never "the last one that looks right";
+          #   - its findings block is signed with the key only this job holds, for
+          #     this repo, this pull request and this commit. That is the only way
+          #     a carried, already-reviewed, or nothing-new verdict is accepted.
+          # Anyone who can post as github-actions[bot] can write a review whose
+          # body says "must fix before merge (0)"; neither path accepts it.
+          #
+          # With the key, the number the gate blocks on is the signed
+          # gate.critical of a block that verifies — on every path, including the
+          # review this run just posted. The heading is the agent's summary text
+          # and is never parsed. Without the key there is nothing signed to read,
+          # so the heading post-review.sh rewrote from the findings is read.
+          body=""; signed_crit=""
+          # verified_crit <body>: the signed count of its block, or exit the step.
+          verified_crit() {
+            local blk vrc=0
+            blk="$(printf '%s' "$1" | python3 "$SIG" extract)" || blk=""
+            printf '%s' "$blk" | python3 "$SIG" verify "$REPO" "$PR" "$ruled_on" || vrc=$?
+            case "$vrc" in
+              0) printf '%s' "$blk" | jq -r '.gate.critical | select(type == "number") | tostring' ;;
+              1) return 1 ;;
+              *) echo "::error title=Could not check a signature::The verdict on \`${ruled_on:0:8}\` could not be verified (exit $vrc), so it is not trusted." >&2; exit 1 ;;
+            esac
+          }
+          if [ -n "${REVIEW_ID:-}" ] && [ "${TRIAGE:-}" != "carried" ] && [ "${SKIPPED:-}" != "true" ]; then
+            body="$(gh api "repos/$REPO/pulls/$PR/reviews/$REVIEW_ID" 2>/dev/null \
+              | jq -r --arg sha "$ruled_on" 'select(.user.login == "github-actions[bot]" and .commit_id == $sha) | .body // ""' 2>/dev/null || true)"
+            if [ -n "$body" ] && [ "${SIGNING:-off}" = "on" ]; then
+              signed_crit="$(verified_crit "$body")" || {
+                echo "::error title=The posted review does not verify::The review this run posted carries no valid signature, so its count cannot be trusted."
+                exit 1
+              }
+            fi
+          elif [ "${SIGNING:-off}" = "on" ]; then
+            gh api "repos/$REPO/pulls/$PR/reviews" --paginate 2>/dev/null \
+              | jq -s -c --arg sha "$ruled_on" '[ (add // [])[]
+                  | select(.user.login == "github-actions[bot]" and .commit_id == $sha)
+                  | select((.body // "") | contains("Lindamar Code Review Result")) ] | reverse | .[]' \
+              > "$RUNNER_TEMP/candidates.jsonl" 2>/dev/null || : > "$RUNNER_TEMP/candidates.jsonl"
+            # The NEWEST of the reviewer's reviews of that commit, and only it.
+            # Falling back past one that does not verify to an older one that
+            # does let an edit to the newest verdict (any Actions token in the
+            # repository posts as this identity) bring back an older, greener
+            # one; a commit can hold several since a person can have a blocked
+            # commit ruled on again (lindamar-reviewer#86). So the newest must
+            # verify, or nothing is read and the check fails.
+            r="$(head -n 1 "$RUNNER_TEMP/candidates.jsonl")"
+            if [ -n "$r" ]; then
+              b="$(printf '%s' "$r" | jq -r '.body')"
+              if c="$(verified_crit "$b")"; then
+                body="$b"; signed_crit="$c"
+              else
+                echo "::error title=The newest verdict does not verify::The reviewer's newest review of \`${ruled_on:0:8}\` carries no valid signature, so it is not trusted, and an older verdict is not read in its place. Start a review of this commit by hand, or push."
+                exit 1
+              fi
+            fi
+          elif [ "${TRIAGE:-}" = "carried" ] || [ "${SKIPPED:-}" = "true" ] || [ "$REVIEW_RAN" = "true" ]; then
+            echo "::warning title=Cannot verify an earlier verdict::No signing key is configured, so a verdict this run did not post itself cannot be trusted."
+          fi
+          # A run that skipped because this commit ALREADY has a verdict must
+          # read that verdict, not fail for not having produced one. Without
+          # this, the early-exit added today turned a passing pull request into
+          # a blocked one: the dispatch short-circuited correctly, the gate saw
+          # no review of its own, failed, and carry-verdict wrote a red check
+          # over the green one. The feature made things worse than not having it.
+          if [ "${TRIAGE:-}" = "carried" ]; then
+            if [ -z "$ruled_on" ] || [ -z "$body" ]; then
+              echo "::error title=No verdict to carry::Triage carried the verdict from \`${ruled_on:-?}\`, and that verdict cannot now be read. Refusing to pass on an assumption; push again or start a review by hand."
+              exit 1
+            fi
+          elif [ "${SKIPPED:-}" = "true" ]; then
+            if [ -z "$body" ]; then
+              echo "::error title=No review for this commit::The run skipped because a verdict was reported on \`$HEAD_SHA\`, and that verdict cannot now be read. Refusing to pass on an assumption."
+              exit 1
+            fi
+            echo "already reviewed at this commit; reading that verdict rather than producing a new one"
+          elif [ "$REVIEW_RAN" != "true" ]; then
+            # The review never ran — a setup step failed and already said why.
+            # Adding "the reviewer did not post a verdict" here would report a
+            # second, wrong cause for one failure, and send whoever reads it
+            # looking at the reviewer instead of at the missing secret.
+            echo "::notice title=Review did not run::A step before the review failed; see the first error in this job. Nothing was reviewed, and this job is failing for that reason alone."
+            exit 1
+          fi
+          if [ -z "$body" ]; then
+            echo "::error title=No review for this commit::The review ran but recorded no verdict against \`$HEAD_SHA\`, so nothing on this commit was checked. This is not a pass. A verdict on an earlier commit is deliberately not accepted here."
+            exit 1
+          fi
+          if [ "${SIGNING:-off}" = "on" ]; then
+            case "$signed_crit" in
+              ''|*[!0-9]*)
+                echo "::error title=No signed count::The verdict on \`${ruled_on:0:8}\` carries no signed critical count, so there is nothing trustworthy to gate on."
+                exit 1 ;;
+            esac
+            crit="$signed_crit"
+          else
+            crit="$(printf '%s' "$body" | sed -n 's/.*Critical.*must fix before merge (\([0-9]*\)).*/\1/p' | head -1)"
+            crit="${crit:-0}"
+          fi
+          echo "critical findings: $crit"
+          if [ "${SIGNING:-off}" != "on" ]; then
+            { echo "### no signing key"; echo ""; echo "LINDAMAR_FINDINGS_KEY is not configured, so nothing is carried between rounds and every push is a full review."; } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          # A subset round says so on the check: what was re-read, and what kept
+          # the earlier review's verdict.
+          if [ -n "${SCOPE:-}" ] && [ "$SCOPE" != "full" ] && [ "${TRIAGE:-}" != "carried" ]; then
+            n="$(printf '%s\n' "$SCOPE" | grep -c .)"
+            msg="Reviewed $n of ${SCOPE_TOTAL:-?} files changed since ${SCOPE_FROM:0:8}; $(( ${SCOPE_TOTAL:-$n} - n )) carried."
+            echo "::notice title=subset review::$msg"
+            { echo "### subset review"; echo ""; echo "$msg"; echo ""; printf '%s\n' "$SCOPE" | sed 's/^/- /'; } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if [ "$crit" -gt 0 ] && [ "$FAIL_ON_CRITICAL" = "true" ]; then
+            echo "::error title=$crit critical finding(s)::See the review on the pull request. Each finding carries a fix prompt. This check is the gate; an App review cannot block a merge on its own."
+            exit 1
+          fi
+
+      # One short comment, edited rather than repeated. Not a review: a review
+      # would put "nothing was checked" in the same place as findings, and a
+      # REQUEST_CHANGES would then need a person to dismiss it. And one comment
+      # rather than one per attempt, because a retry loop that leaves a trail of
+      # identical notices floods the Slack channel.
+      #
+      # It doubles as the retry marker: lindamar-review-retry.yml looks for
+      # exactly this marker, so only a pull request the reviewer actually tried
+      # and could not finish is ever retried. One nobody has attempted is
+      # `install-action.sh --backfill`'s job, not the cron's.
+      - name: Say briefly that the review could not run
+        if: always() && !cancelled() && needs.agent.outputs.blocked != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ needs.agent.outputs.number }}
+          BLOCKED: ${{ needs.agent.outputs.blocked }}
+          RESET_AT: ${{ needs.agent.outputs.reset_at }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -uo pipefail
+          # Both come from the agent job's Review step, which ran the agent: the
+          # values are checked here rather than trusted, since they end up in a
+          # comment posted as the reviewer.
+          case "${BLOCKED:-}" in usage|auth|nowork) ;; *) BLOCKED=other ;; esac
+          printf '%s' "${RESET_AT:-}" | grep -Eq '^[0-9]{1,2}:[0-9]{2}( ?[ap]m)?$' || RESET_AT=""
+          # The reason goes in the marker. One marker for every reason meant
+          # the retry could not tell a usage block — which clears itself — from
+          # an auth block, which never does until somebody rotates a secret. The
+          # prefix stays stable so the cleanup step still finds it.
+          MARK="<!-- lindamar-review:blocked:${BLOCKED:-other} -->"
+          case "$BLOCKED" in
+            usage)
+              headline="**The reviewer has no usage left, so this pull request was not checked.**"
+              detail="Nothing here is yours to fix. It retries on its own${RESET_AT:+, and the credential resets around \`$RESET_AT\`}. The check stays red until a review actually runs, because an unreviewed commit is not a passing one." ;;
+            auth)
+              headline="**The credential was refused, so this pull request was not checked.**"
+              detail="Retrying will not help until the secret is replaced. Nothing here is yours to fix." ;;
+            *)
+              headline="**The reviewer could not complete, so this pull request was not checked.**"
+              detail="It stopped before reading the diff. Nothing here is yours to fix; it retries on its own." ;;
+          esac
+          body="$(printf '%s\n\n%s\n\n%s\n\n[What happened](%s) · last attempt %s\n' \
+                   "$MARK" "$headline" "$detail" "$RUN_URL" "$(date -u '+%Y-%m-%d %H:%M UTC')")"
+          # `.user.type == "Bot"` as well as the marker. Matching on the marker
+          # alone means anyone who quotes the notice in their own comment — which
+          # is what people do when they reply to it — owns a comment this step
+          # will then edit or delete. Editing somebody else's words is not a
+          # behaviour to leave to chance.
+          # `|| true` on the assignment. The runner invokes this block with
+          # `bash -e`, so a `gh` hiccup inside the command substitution kills the
+          # step outright — sh-205, the rule added in this very branch, broken in
+          # the same branch. Here it only loses the upsert; below it is worse.
+          id="$(gh api --paginate "repos/$REPO/issues/$PR/comments" 2>/dev/null \
+                | jq -s -r --arg m "$MARK" '[ (add // [])[]
+                    | select(.user.type == "Bot")
+                    | select((.body // "") | contains($m)) ] | last | .id // empty' || true)"
+          if [ -n "$id" ]; then
+            gh api -X PATCH "repos/$REPO/issues/comments/$id" -f body="$body" >/dev/null 2>&1 \
+              && echo "  edited the existing notice ($id)" || echo "::warning::could not edit the notice"
+          else
+            gh api -X POST "repos/$REPO/issues/$PR/comments" -f body="$body" >/dev/null 2>&1 \
+              && echo "  posted one notice" || echo "::warning::could not post the notice"
+          fi
+
+      # And take it down once a review has actually run, so a pull request that
+      # recovered does not keep a stale "could not run" notice on it — and so the
+      # retry cron stops picking it up.
+      - name: Remove the notice once a review has run
+        if: always() && needs.agent.outputs.ran == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ needs.agent.outputs.number }}
+        # `continue-on-error`, because this step runs on the happy path of every
+        # reviewed pull request and removes a cosmetic notice. Without it a
+        # transient `gh` failure fails the job, which skips "Approve when nothing
+        # blocks", fires the step that withdraws an existing approval, and posts
+        # the required status as failure — on a pull request whose gate passed.
+        # Tidying up a comment must never be able to do that.
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          # Prefix, no closing `-->`. When the marker gained its reason
+          # (`:usage`, `:auth`, `:other`) this exact-string search stopped
+          # matching, so the notice was never removed: a pull request that
+          # recovered kept a stale "could not run" comment, and the retry kept
+          # picking it up forever. I changed the marker format and fixed the
+          # retry's query and not this one.
+          id="$(gh api --paginate "repos/$REPO/issues/$PR/comments" 2>/dev/null \
+                | jq -s -r '[ (add // [])[]
+                    | select(.user.type == "Bot")
+                    | select((.body // "") | contains("<!-- lindamar-review:blocked")) ] | last | .id // empty' || true)"
+          [ -n "$id" ] || exit 0
+          gh api -X DELETE "repos/$REPO/issues/comments/$id" >/dev/null 2>&1 \
+            && echo "  removed the stale notice" || echo "  could not remove the stale notice"
+
+      # ORDER IS THE WHOLE MECHANISM. These sit after the gate on purpose: when
+      # they ran before it, `success()` was evaluated while the gate had not yet
+      # run, so the first live run approved a pull request that had an
+      # outstanding critical finding. The required status check was the only
+      # thing that stopped the merge. An approval issued before the thing that
+      # decides is not a gate, it is a rubber stamp with better wording.
+      # Not on a skip. An approval says "the review found nothing", and on a
+      # skip there was no review: approving a bot's dependency bump because the
+      # rule let it through unread is exactly the rubber stamp described above.
+      - name: Approve when nothing blocks
+        # A carried verdict approves only when triage said the approval
+        # carries too: it was APPROVED, and the head moved by merges alone.
+        if: success() && (needs.agent.outputs.skip == '' || (needs.agent.outputs.skip == 'carried' && needs.agent.outputs.carry_approve == 'true'))
+        env:
+          PAT: ${{ secrets.LINDAMAR_APPROVER_PAT }}
+          REPO: ${{ github.repository }}
+          PR: ${{ needs.agent.outputs.number }}
+          HEAD_SHA: ${{ needs.agent.outputs.sha }}
+          CARRIED_FROM: ${{ needs.agent.outputs.carried_from }}
+          AUTHOR: ${{ needs.agent.outputs.author }}
+        run: |
+          # This token exists to do one thing. The findings are posted by
+          # github-actions[bot]; the PAT only ever submits an APPROVE, so the
+          # blast radius of it leaking is "can approve", not "can say anything".
+          [ -n "${PAT:-}" ] || { echo "No approver configured — leaving the approval to a person."; exit 0; }
+          who="$(curl -sS -H "Authorization: Bearer $PAT" https://api.github.com/user | jq -r '.login // empty')"
+          if [ "$who" = "$AUTHOR" ]; then
+            echo "::warning title=Cannot approve its own pull request::GitHub refuses an approval from the PR's author, and this one was opened by $AUTHOR — the same account that approves. This PR needs a human approval."
+            exit 0
+          fi
+          # printf, not a multi-line literal: inside a `run: |` block a
+          # continuation line at column 0 ends the block and the YAML stops
+          # parsing. Cost one failed parse to learn.
+          first="**Approved automatically.** The review found nothing that blocks a merge on \`${HEAD_SHA:0:8}\`."
+          [ -n "${CARRIED_FROM:-}" ] && first="**Approved automatically.** The review of \`${CARRIED_FROM:0:8}\` found nothing that blocks a merge, and \`${HEAD_SHA:0:8}\` differs from it only by merges from the base branch: this pull request's own diff is unchanged."
+          body="$(printf '%s\n\n%s\n\n%s\n' \
+            "$first" \
+            "This approval was submitted by automation using the \`$who\` account. **No person read this diff.** It records that the automated review completed and reported no blocking finding — nothing more. The findings themselves, including anything non-blocking, are in the review comment above." \
+            "A GitHub App's approval does not count toward a required review, so a user account is the only identity GitHub accepts here.")"
+          code=$(curl -sS -o /tmp/ap.json -w '%{http_code}' -X POST \
+            -H "Authorization: Bearer $PAT" -H "Accept: application/vnd.github+json" \
+            -d "$(jq -n --arg b "$body" --arg c "$HEAD_SHA" '{event:"APPROVE", body:$b, commit_id:$c}')" \
+            "https://api.github.com/repos/$REPO/pulls/$PR/reviews")
+          if [ "$code" = "200" ] || [ "$code" = "201" ]; then
+            echo "approved as $who"
+          else
+            echo "::warning title=Could not approve::HTTP $code — $(jq -r '.message // "?"' /tmp/ap.json 2>/dev/null). This PR needs a human approval."
+          fi
+
+      - name: Withdraw a previous approval when something now blocks
+        if: failure() && !cancelled()
+        env:
+          PAT: ${{ secrets.LINDAMAR_APPROVER_PAT }}
+          REPO: ${{ github.repository }}
+          PR: ${{ needs.agent.outputs.number }}
+        run: |
+          # Without this the gate has a hole. Branch protection here keeps
+          # dismiss_stale_reviews off, so an approval survives later pushes: the
+          # reviewer could approve a clean commit, a critical could land in the
+          # next one, and the stale approval would still satisfy the requirement.
+          # This is the same shape as the stale-review bug in the gate itself.
+          [ -n "${PAT:-}" ] || exit 0
+          who="$(curl -sS -H "Authorization: Bearer $PAT" https://api.github.com/user | jq -r '.login // empty')"
+          [ -n "$who" ] || exit 0
+          ids="$(curl -sS -H "Authorization: Bearer $PAT" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/pulls/$PR/reviews?per_page=100" \
+            | jq -r --arg w "$who" '.[] | select(.user.login == $w) | select(.state == "APPROVED") | .id')"
+          [ -n "$ids" ] || { echo "no earlier approval to withdraw"; exit 0; }
+          for id in $ids; do
+            curl -sS -o /dev/null -X PUT -H "Authorization: Bearer $PAT" \
+              -H "Accept: application/vnd.github+json" \
+              -d '{"message":"Withdrawn: a later commit introduced a finding that blocks. The earlier approval referred to a commit that is no longer the head."}' \
+              "https://api.github.com/repos/$REPO/pulls/$PR/reviews/$id/dismissals"
+            echo "withdrew approval $id"
+          done
+
+      - name: Tell Slack what happened
+        if: always() && !cancelled() && needs.agent.outputs.skip == ''
+        env:
+          BOT: ${{ secrets.LINDAMAR_SLACK_BOT_TOKEN }}
+          CH: ${{ secrets.LINDAMAR_SLACK_CHANNEL }}
+          HOOK: ${{ secrets.LINDAMAR_SLACK_WEBHOOK }}
+          START_TS: ${{ needs.agent.outputs.slack_ts }}
+          REPO: ${{ github.repository }}
+          PR: ${{ needs.agent.outputs.number }}
+          TITLE: ${{ needs.agent.outputs.title }}
+          URL: ${{ needs.agent.outputs.url }}
+          AUTHOR: ${{ needs.agent.outputs.author }}
+          GATE: ${{ steps.gate.outcome }}
+          REVIEW_RAN: ${{ needs.agent.outputs.ran }}
+          COST: ${{ needs.agent.outputs.cost }}
+        run: |
+          # Best-effort throughout: a notification failing must never fail a
+          # review that already happened.
+          cost="${COST:-not recorded}"
+          if [ "$REVIEW_RAN" != "true" ]; then
+            emoji=":warning:"; verdict="did not run — nothing was checked"
+          elif [ "$GATE" = "success" ]; then
+            emoji=":white_check_mark:"; verdict="nothing blocking"
+          else
+            emoji=":red_circle:"; verdict="blocked — critical findings"
+          fi
+          line1="$emoji *<$URL|$REPO #$PR>* — $verdict"
+          line2="$(printf '%.90s' "$TITLE")  ·  by $AUTHOR  ·  $cost"
+          txt="$line1"$'\n'"$line2"
+
+          if [ -n "${BOT:-}" ] && [ -n "${CH:-}" ]; then
+            # Edit the "reviewing…" message into the result rather than adding a
+            # second one. Only a bot token can do this; a webhook's messages are
+            # owned by the webhook and cannot be edited or deleted afterwards.
+            if [ -n "${START_TS:-}" ]; then
+              r=$(curl -sS -m 15 -X POST -H "Authorization: Bearer $BOT" \
+                -H 'Content-type: application/json' \
+                -d "$(jq -n --arg c "$CH" --arg t "$START_TS" --arg x "$txt" '{channel:$c, ts:$t, text:$x}')" \
+                https://slack.com/api/chat.update)
+            else
+              r=$(curl -sS -m 15 -X POST -H "Authorization: Bearer $BOT" \
+                -H 'Content-type: application/json' \
+                -d "$(jq -n --arg c "$CH" --arg x "$txt" '{channel:$c, text:$x}')" \
+                https://slack.com/api/chat.postMessage)
+            fi
+            printf '%s' "$r" | jq -e '.ok' >/dev/null 2>&1 \
+              && echo "notified via bot token" \
+              || echo "::warning title=Slack not notified::$(printf '%s' "$r" | jq -r '.error // "?"'). The review is unaffected."
+          elif [ -n "${HOOK:-}" ]; then
+            curl -sS -m 15 -X POST -H 'Content-type: application/json' \
+              --data "$(jq -n --arg t "$txt" '{text:$t}')" "$HOOK" >/dev/null 2>&1 \
+              && echo "notified via webhook" || echo "::warning title=Slack not notified::The review is unaffected."
+          fi
+
+  # Separate job, for one reason: it needs `statuses: write` and the review job
+  # must not have it. A job-level permission belongs to every step in that job,
+  # and one of those steps runs an unattended agent over a diff anyone can open a
+  # pull request with. Splitting it means the token that can satisfy the merge
+  # gate exists only in a job that reads three strings and calls one endpoint.
+  #
+  # Why it is needed at all: a hand-started run attaches its check to the branch
+  # it was dispatched from, not to the pull request's head commit, so the
+  # required check on that pull request stays unfulfilled however this run
+  # concluded — the review would read as advisory when it is not.
+  #
+  # Cost of the split: on the normal path this job is skipped, and a skipped job
+  # still shows a row in the pull request's checks list. It reads as "Skipped",
+  # counts as neutral for branch protection, and is the honest price of not
+  # handing the agent's job a token that can green the gate.
+  #
+  # The context is `review / Lindamar review`, not `Lindamar review`: GitHub
+  # qualifies a reusable-workflow job with the caller's job id. The first version
+  # hardcoded the unqualified name, which satisfies no required check anywhere —
+  # the status posts, the step prints success, and the pull request sits blocked
+  # forever. It is an input so a caller that renames its job can say so.
+  carry-verdict:
+    name: Carry the verdict to the pull request
+    needs: [agent, review]
+    # Keyed on the input, NOT on the review job's `dispatched` output. That output
+    # only exists once the review job reaches the step that resolves the pull
+    # request, so a run that died earlier — a missing credential, a refused Checkmate
+    # token — skipped this job entirely and left the required check pending with
+    # nothing anywhere saying why. That failure path is exactly the one this job
+    # exists for.
+    if: always() && inputs.pr != ''
+    runs-on: ubuntu-latest
+    permissions:
+      # read, so this job can find the head sha itself when the review job died
+      # before publishing it.
+      pull-requests: read
+      statuses: write
+      # A commit status does NOT clear a failing check run of the same name.
+      # Measured on a client pull request: status green at 16:13, check run red at 15:13,
+      # pull request still blocked. That disabled the retry for its own use case,
+      # since a pull request whose review failed has a red check run by
+      # definition. A check run supersedes the earlier one; a status cannot.
+      #
+      # The Checks API is App-only — a user PAT gets "You must authenticate via a
+      # GitHub App". The runner's GITHUB_TOKEN is an App token, so it can.
+      checks: write
+    steps:
+      - name: Post the commit status on the pull request head
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ inputs.pr }}
+          SHA_FROM_REVIEW: ${{ needs.agent.outputs.sha }}
+          GATE: ${{ needs.review.outputs.gate }}
+          REVIEW_RESULT: ${{ needs.review.result }}
+          CONTEXT: ${{ inputs.status-context }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -uo pipefail
+          sha="${SHA_FROM_REVIEW:-}"
+          if [ -z "$sha" ]; then
+            sha="$(gh api "repos/$REPO/pulls/$PR" --jq '.head.sha' 2>/dev/null)" || sha=""
+          fi
+          if [ -z "$sha" ]; then
+            echo "::error title=No head commit to report on::The review job published none and $REPO#$PR could not be read, so the required check there stays unfulfilled."
+            exit 1
+          fi
+          # Fails closed: green only when the gate said success AND the review job
+          # as a whole succeeded. Anything else — empty because the job died
+          # early, skipped, cancelled — is a failure, so an outcome nobody
+          # anticipated cannot green the check.
+          if [ "$GATE" = "success" ] && [ "$REVIEW_RESULT" = "success" ]; then
+            state=success; desc="Reviewed. No critical findings."
+          elif [ -z "$GATE" ]; then
+            state=failure; desc="The review did not run far enough to reach a verdict. See the run."
+          else
+            state=failure; desc="Critical findings, or the review did not complete. See the run."
+          fi
+          # The check run is what branch protection actually reads. The status is
+          # kept alongside it because a repository may have the context wired as
+          # a status from before, and an extra green status costs nothing.
+          conc=failure; [ "$state" = success ] && conc=success
+          ok=0
+          gh api -X POST "repos/$REPO/check-runs" \
+            -f name="$CONTEXT" -f head_sha="$sha" -f status=completed \
+            -f conclusion="$conc" -f details_url="$RUN_URL" \
+            -f "output[title]=$desc" \
+            -f "output[summary]=Posted by a hand-started review. A dispatched run attaches its own check to the branch it was dispatched from, not to this commit, so the verdict is written here instead." \
+            >/dev/null 2>&1 && ok=1
+
+          gh api -X POST "repos/$REPO/statuses/$sha" \
+            -f state="$state" -f context="$CONTEXT" \
+            -f description="$desc" -f target_url="$RUN_URL" >/dev/null 2>&1 || true
+
+          if [ "$ok" -eq 1 ]; then
+            printf '  %s on %s as a check run named "%s"\n' "$conc" "$sha" "$CONTEXT"
+          else
+            echo "::error title=Could not write the check run::The required check on \`$sha\` was not updated, so the pull request stays blocked even though the review completed."
+            exit 1
+          fi

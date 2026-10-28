@@ -1,0 +1,569 @@
+name: Checkmate agent fix
+
+# Reusable workflow. The installed caller (see README.md) runs it when the Checkmate console dispatches that caller with `agent_fix`
+# set: an admin asked an agent to resolve a suggestion the platform cannot
+# automate (a Yarn 1 lockfile, a transitive dependency with no override path, a
+# breaking major upgrade), or asked for a package-manager change in one
+# directory: consolidate its lockfiles on the manager in use, migrate it to
+# pnpm, or turn dependency install scripts off. The package-manager steps that
+# decide the outcome (which lockfiles go, what `packageManager` says, the
+# scripts setting) are the resolve job's, never the agent's: the agent only
+# changes what references the manager (scripts, Dockerfile, vercel.json, docs),
+# and lists what it cannot change under .github/ for a person to apply.
+#
+# PASSES (INFOSEC-1178, layer 3)
+#
+# The agent, resolve and pre-review jobs below are one pass, in
+# agent-fix-round.yml. A pass whose pre-review finds nothing that blocks a
+# merge is published; one that finds something hands its findings (rule,
+# file, line, title, fixPrompt; at most 20 and 8 KB) to the next pass. At most
+# three passes, and none past the cost cap. No pass has a shell or the web in
+# its agent, and the pre-review holds the Claude credential and no GitHub
+# token. The pass count and each pass's measured cost go in the step summary
+# and the pull request.
+#
+# FOUR JOBS, AND WHAT EACH ONE HOLDS
+#
+#   skills   a token from Checkmate that reads the reviewer repo, revoked
+#            after the checkout, and no Claude credential. It hands on the review's own
+#            rule skills, so the agent is held to what it will be judged by.
+#   agent    the Claude credential, and nothing that can run a command: the
+#            agent's tools are Read, Edit, Write, Glob and Grep. It edits the
+#            manifests (and code, for a breaking major) and the job packages
+#            its change as a patch.
+#   resolve  no secret at all. It applies the patch to a fresh checkout and
+#            regenerates the lockfile with the package manager, every command
+#            with install scripts off on its own command line (and in the
+#            environment and the user's rc files as well).
+#            Then it checks, with no model: one JS lockfile per directory, a
+#            frozen install passes, the target version resolves in every
+#            lockfile, nothing under .github/. A failure opens no pull request.
+#   publish  a write token for this repository from Checkmate, fetched here,
+#            and no Claude credential. It
+#            applies the resolved patch to a fresh checkout, commits with hooks
+#            off, pushes `lindamar/agent-fix-<slug>` and opens the PR.
+#
+# So a third-party install script never runs where a credential is, and even
+# if one ran, the job it ran in holds nothing to steal. Each job starts from a
+# fresh checkout, so nothing one job wrote into .git or the runner reaches the
+# next; only the two patch artifacts cross, and each is checked for paths
+# under .github/ before it is applied.
+#
+# The prompt is built from the dispatch's fields and nothing else, each checked
+# against a fixed shape; the reason is one of four codes whose instructions
+# live here. No pull request text reaches the agent.
+#
+# Why the App and not GITHUB_TOKEN for the push: a pull request opened with
+# GITHUB_TOKEN starts no workflow, so the review and the repository's own CI
+# would never run on the change that most needs them. The App's token is
+# issued by the caller's Checkmate tenant through GitHub Actions OIDC
+# (`checkmate-url`), so the caller holds no App key. It is limited to this
+# repository with `contents` and `pull_requests` write, has no `workflows`
+# scope, and is revoked when the pull request is open. The calling job must
+# grant `id-token: write`: a reusable workflow cannot raise its caller's
+# permissions.
+
+on:
+  workflow_call:
+    inputs:
+      checkmate-url:
+        description: "Your Checkmate console URL, e.g. https://<tenant>.example.com, with no trailing slash. It is the OIDC audience and the base of the token exchange (POST <checkmate-url>/v1/actions/token). The calling job must grant `id-token: write`."
+        type: string
+        required: true
+      task:
+        description: "The suggestion, as JSON: package, ecosystem, lockfile, from, to, reason, slug. Set by the Checkmate console."
+        type: string
+        required: true
+      model:
+        type: string
+        default: claude-opus-5
+      timeout-minutes:
+        type: number
+        default: 30
+      max-turns:
+        type: number
+        default: 80
+      cost-cap:
+        description: "The most this dispatch may spend on Claude, in USD, over every pass: a pass is not started past it, and the run fails saying so."
+        type: number
+        default: 20
+      reviewer-ref:
+        description: "Ref of the reviewer repo whose review skills the agent is given: the same ref the review runs, so the fix is held to the rules it is judged by."
+        type: string
+        default: v1
+    secrets:
+      ANTHROPIC_API_KEY:
+        required: false
+      CLAUDE_CODE_OAUTH_TOKEN:
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: checkmate-agent-fix-${{ github.repository }}-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  # The reviewer's own rule catalogues, for the agent to meet before it is
+  # judged by them (INFOSEC-1178, layer 1). The reviewer repo is private, so
+  # a token from Checkmate reads it here, limited to that repository and to
+  # contents, and is revoked right after the checkout. This job never sees the Claude
+  # credential, runs no agent, and hands on only the skill files.
+  skills:
+    name: Checkmate agent fix (review skills)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      # Only to fetch the OIDC token exchanged for the reviewer read token.
+      id-token: write
+    steps:
+      - name: Which skills
+        id: which
+        env:
+          TASK: ${{ inputs.task }}
+        run: |
+          set -euo pipefail
+          # The authored rule skills the review always loads (not lindamar-review-pr,
+          # the orchestrator), and the stack skills for the ecosystem the task names.
+          authored="lindamar-review-base lindamar-review-supply-chain lindamar-review-security lindamar-review-shell lindamar-review-sql"
+          case "$(printf '%s' "$TASK" | jq -r '.ecosystem // ""' 2>/dev/null)" in
+            npm)  stack="typescript-react-reviewer react-nextjs-patterns typescript-advanced-types" ;;
+            pypi) stack="fastapi-python" ;;
+            *)    stack="" ;;
+          esac
+          echo "skills=$authored $stack" >> "$GITHUB_OUTPUT"
+
+      - name: Get a reviewer read token from Checkmate
+        id: app
+        env:
+          CHECKMATE_URL: ${{ inputs.checkmate-url }}
+          WANT: '["reviewer"]'
+        run: |
+          # OIDC token for audience = checkmate-url, exchanged at the tenant.
+          # Neither token is printed; a refusal names the HTTP status and never
+          # the response body.
+          set -euo pipefail
+          url="${CHECKMATE_URL%/}"
+          case "$url" in https://?*) ;; *) echo "::error title=checkmate-url is not an https URL::Set the checkmate-url input to your Checkmate console URL."; exit 1 ;; esac
+          if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+            echo "::error title=No OIDC token available::The job that calls this workflow must grant \`permissions: id-token: write\`. A reusable workflow cannot grant it to itself."
+            exit 1
+          fi
+          aud="$(jq -rn --arg a "$url" '$a | @uri')"
+          oidc="$(curl -sS -f -m 30 -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+                    "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$aud" 2>/dev/null | jq -r '.value // empty' 2>/dev/null)" || oidc=""
+          [ -n "$oidc" ] || { echo "::error title=Could not get an OIDC token::GitHub did not issue an ID token for this job."; exit 1; }
+          echo "::add-mask::$oidc"
+          resp="$(mktemp)"; chmod 600 "$resp"
+          code="$(curl -sS -m 30 -o "$resp" -w '%{http_code}' -X POST \
+                    -H "Authorization: Bearer $oidc" -H "Content-Type: application/json" \
+                    -d "{\"tokens\":$WANT}" "$url/v1/actions/token" 2>/dev/null)" || code="000"
+          unset oidc
+          if [ "$code" != "200" ]; then
+            rm -f "$resp"
+            case "$code" in
+              401) why="the OIDC token was not accepted" ;;
+              403) why="this repository or workflow ref is not allowed for this tenant" ;;
+              503) why="the tenant cannot issue tokens right now; retry later" ;;
+              *)   why="unexpected answer" ;;
+            esac
+            echo "::error title=Checkmate refused the token request (HTTP $code)::$why. Response body not shown."
+            exit 1
+          fi
+          tok="$(jq -r '.token // empty' "$resp" 2>/dev/null || true)"
+          rtok="$(jq -r '.reviewer_token // empty' "$resp" 2>/dev/null || true)"
+          rm -f "$resp"
+          [ -z "$tok" ] || echo "::add-mask::$tok"
+          [ -z "$rtok" ] || echo "::add-mask::$rtok"
+          [ -n "$rtok" ] || { echo "::error title=No reviewer token::Checkmate answered 200 without one."; exit 1; }
+          echo "token=$rtok" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          repository: Cincinnati-Associates/lindamar-reviewer
+          ref: ${{ inputs.reviewer-ref }}
+          token: ${{ steps.app.outputs.token }}
+          path: .lindamar-reviewer
+          persist-credentials: false
+
+      - name: Revoke the read token
+        if: always() && steps.app.outputs.token != ''
+        env:
+          TOK: ${{ steps.app.outputs.token }}
+        run: |
+          code=$(curl -sS -o /dev/null -w '%{http_code}' -X DELETE \
+            -H "Authorization: Bearer $TOK" -H "Accept: application/vnd.github+json" \
+            https://api.github.com/installation/token || echo "000")
+          echo "revoke returned HTTP $code"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install the review skills, and keep the ones the agent needs
+        working-directory: .lindamar-reviewer
+        env:
+          SKILLS: ${{ steps.which.outputs.skills }}
+          npm_config_yes: "true"
+        run: |
+          set -euo pipefail
+          # The same installer the review runs, which checks the installed set
+          # against its lock and the authored list and exits non-zero on a gap.
+          npm install --no-audit --no-fund --ignore-scripts
+          sh scripts/install-skills.sh || { sleep 10; sh scripts/install-skills.sh; }
+          mkdir -p "$RUNNER_TEMP/skills"
+          for s in $SKILLS; do
+            [ -f ".claude/skills/$s/SKILL.md" ] || { echo "::error title=Review skill missing::$s is not installed, so the agent would not be held to it."; exit 1; }
+            cp -R ".claude/skills/$s" "$RUNNER_TEMP/skills/$s"
+          done
+          # The pre-review runs the review's own enumerators and reads its own
+          # config, from this same checkout: never a copy kept elsewhere.
+          mkdir -p "$RUNNER_TEMP/skills/.reviewer"
+          cp -R scripts config "$RUNNER_TEMP/skills/.reviewer/"
+          ls "$RUNNER_TEMP/skills"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: checkmate-skills-${{ github.run_id }}
+          path: ${{ runner.temp }}/skills
+          # skills/.reviewer holds the enumerators and config: upload-artifact v4
+          # (4.4.0+) drops hidden paths unless told not to (base-101, #62).
+          include-hidden-files: true
+          retention-days: 1
+
+  # Up to three passes (INFOSEC-1178, layer 3): the first, and at most two more
+  # while the pre-review still finds something that blocks a merge and the cost
+  # cap is not reached. Actions has no loops, so they are three calls.
+  round1:
+    needs: skills
+    uses: Cincinnati-Associates/checkmate-actions/.github/workflows/agent-fix-round.yml@v1
+    with:
+      task: ${{ inputs.task }}
+      round: 1
+      spent: 0
+      cost-cap: ${{ inputs.cost-cap }}
+      model: ${{ inputs.model }}
+      timeout-minutes: ${{ inputs.timeout-minutes }}
+      max-turns: ${{ inputs.max-turns }}
+    secrets:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+
+  round2:
+    needs: [skills, round1]
+    if: needs.round1.outputs.verdict == 'critical' && fromJSON(needs.round1.outputs.spent || '0') < inputs.cost-cap
+    uses: Cincinnati-Associates/checkmate-actions/.github/workflows/agent-fix-round.yml@v1
+    with:
+      task: ${{ inputs.task }}
+      round: 2
+      findings: ${{ needs.round1.outputs.findings }}
+      spent: ${{ fromJSON(needs.round1.outputs.spent) }}
+      cost-cap: ${{ inputs.cost-cap }}
+      model: ${{ inputs.model }}
+      timeout-minutes: ${{ inputs.timeout-minutes }}
+      max-turns: ${{ inputs.max-turns }}
+    secrets:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+
+  round3:
+    needs: [skills, round2]
+    if: needs.round2.outputs.verdict == 'critical' && fromJSON(needs.round2.outputs.spent || '0') < inputs.cost-cap
+    uses: Cincinnati-Associates/checkmate-actions/.github/workflows/agent-fix-round.yml@v1
+    with:
+      task: ${{ inputs.task }}
+      round: 3
+      findings: ${{ needs.round2.outputs.findings }}
+      spent: ${{ fromJSON(needs.round2.outputs.spent) }}
+      cost-cap: ${{ inputs.cost-cap }}
+      model: ${{ inputs.model }}
+      timeout-minutes: ${{ inputs.timeout-minutes }}
+      max-turns: ${{ inputs.max-turns }}
+    secrets:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+
+  # Which pass, if any, publishes: the one whose pre-review found nothing that
+  # blocks. Otherwise the run fails with the reason, and no pull request opens.
+  decide:
+    name: Checkmate agent fix (which pass publishes)
+    needs: [round1, round2, round3]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      round: ${{ steps.pick.outputs.round }}
+      rounds: ${{ steps.pick.outputs.rounds }}
+      package: ${{ steps.pick.outputs.package }}
+      ecosystem: ${{ steps.pick.outputs.ecosystem }}
+      lockfile: ${{ steps.pick.outputs.lockfile }}
+      from: ${{ steps.pick.outputs.from }}
+      to: ${{ steps.pick.outputs.to }}
+      reason: ${{ steps.pick.outputs.reason }}
+      branch: ${{ steps.pick.outputs.branch }}
+      manager: ${{ steps.pick.outputs.manager }}
+      remove: ${{ steps.pick.outputs.remove }}
+    steps:
+      - name: Pick the clean pass
+        id: pick
+        env:
+          ROUNDS: ${{ toJSON(needs) }}
+          CAP: ${{ inputs.cost-cap }}
+        run: |
+          set -euo pipefail
+          # One row per pass that ran: its result, pre-review verdict and cost.
+          rows="$(printf '%s' "$ROUNDS" | jq -r 'to_entries | sort_by(.key)[] | select(.value.result != "skipped")
+                   | "| \(.key | ltrimstr("round")) | \(.value.result) | \(.value.outputs.verdict // "-") | \(.value.outputs.cost // "-") |"')"
+          table="| Pass | Result | Pre-review | Cost (USD) |"$'\n'"|---|---|---|---|"$'\n'"$rows"
+          { echo "### Agent fix passes"; echo "$table"; } >> "$GITHUB_STEP_SUMMARY"
+          { echo "rounds<<ROUNDS_EOF"; echo "$table"; echo "ROUNDS_EOF"; } >> "$GITHUB_OUTPUT"
+          clean="$(printf '%s' "$ROUNDS" | jq -r 'to_entries | sort_by(.key)[] | select(.value.result == "success" and .value.outputs.verdict == "clean") | .key' | head -1)"
+          if [ -z "$clean" ]; then
+            last="$(printf '%s' "$ROUNDS" | jq -c 'to_entries | sort_by(.key) | map(select(.value.result != "skipped")) | last')"
+            result="$(printf '%s' "$last" | jq -r '.value.result')"; spent="$(printf '%s' "$last" | jq -r '.value.outputs.spent // "0"')"
+            if [ "$result" != "success" ]; then why="pass $(printf '%s' "$last" | jq -r '.key | ltrimstr("round")') did not finish: a check, the agent or the pre-review failed; its run says why"
+            elif awk -v s="$spent" -v c="$CAP" 'BEGIN { exit !(s >= c) }'; then why="the pre-review still finds merge-blocking problems, and the dispatch reached its \$$CAP cost cap (\$$spent spent)"
+            else why="the pre-review still finds merge-blocking problems after 3 passes"; fi
+            echo "::error title=Checkmate agent fix: no pull request::$why"
+            mkdir -p "$RUNNER_TEMP/failure"; printf '%s\n' "$why" > "$RUNNER_TEMP/failure/failure.txt"
+            echo "failed=true" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          out="$(printf '%s' "$ROUNDS" | jq -c --arg k "$clean" '.[$k].outputs')"
+          echo "round=${clean#round}" >> "$GITHUB_OUTPUT"
+          for k in package ecosystem lockfile from to reason branch manager remove; do
+            echo "$k=$(printf '%s' "$out" | jq -r --arg k "$k" '.[$k] // ""')" >> "$GITHUB_OUTPUT"
+          done
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: checkmate-failure-${{ github.run_id }}-decide
+          path: ${{ runner.temp }}/failure
+          if-no-files-found: ignore
+          retention-days: 7
+
+  publish:
+    name: Checkmate agent fix (pull request)
+    needs: decide
+    if: needs.decide.outputs.round != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      # Only to fetch the OIDC token exchanged for this repository's write token.
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: checkmate-resolved-${{ github.run_id }}-r${{ needs.decide.outputs.round }}
+          path: ${{ runner.temp }}/change
+
+      - name: Apply the resolved change
+        run: |
+          set -euo pipefail
+          patch="$RUNNER_TEMP/change/resolved.patch"
+          [ -s "$patch" ] || { echo "::error::no resolved change"; exit 1; }
+          git apply --numstat "$patch" | cut -f3 | while IFS= read -r p; do
+            case "$p" in .github/*|.git/*|*/.git/*) echo "::error title=Refused::the patch touches $p"; exit 1 ;; esac
+          done
+          git apply --index "$patch"
+
+      - name: Get a write token for this repository from Checkmate
+        id: app
+        env:
+          CHECKMATE_URL: ${{ inputs.checkmate-url }}
+          WANT: '["repository"]'
+        run: |
+          # After the agent, never before: nothing that can write is in reach of it.
+          # OIDC token for audience = checkmate-url, exchanged at the tenant.
+          # Neither token is printed; a refusal names the HTTP status and never
+          # the response body.
+          set -euo pipefail
+          url="${CHECKMATE_URL%/}"
+          case "$url" in https://?*) ;; *) echo "::error title=checkmate-url is not an https URL::Set the checkmate-url input to your Checkmate console URL."; exit 1 ;; esac
+          if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+            echo "::error title=No OIDC token available::The job that calls this workflow must grant \`permissions: id-token: write\`. A reusable workflow cannot grant it to itself."
+            exit 1
+          fi
+          aud="$(jq -rn --arg a "$url" '$a | @uri')"
+          oidc="$(curl -sS -f -m 30 -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+                    "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$aud" 2>/dev/null | jq -r '.value // empty' 2>/dev/null)" || oidc=""
+          [ -n "$oidc" ] || { echo "::error title=Could not get an OIDC token::GitHub did not issue an ID token for this job."; exit 1; }
+          echo "::add-mask::$oidc"
+          resp="$(mktemp)"; chmod 600 "$resp"
+          code="$(curl -sS -m 30 -o "$resp" -w '%{http_code}' -X POST \
+                    -H "Authorization: Bearer $oidc" -H "Content-Type: application/json" \
+                    -d "{\"tokens\":$WANT}" "$url/v1/actions/token" 2>/dev/null)" || code="000"
+          unset oidc
+          if [ "$code" != "200" ]; then
+            rm -f "$resp"
+            case "$code" in
+              401) why="the OIDC token was not accepted" ;;
+              403) why="this repository or workflow ref is not allowed for this tenant" ;;
+              503) why="the tenant cannot issue tokens right now; retry later" ;;
+              *)   why="unexpected answer" ;;
+            esac
+            echo "::error title=Checkmate refused the token request (HTTP $code)::$why. Response body not shown."
+            exit 1
+          fi
+          tok="$(jq -r '.token // empty' "$resp" 2>/dev/null || true)"
+          rtok="$(jq -r '.reviewer_token // empty' "$resp" 2>/dev/null || true)"
+          rm -f "$resp"
+          [ -z "$tok" ] || echo "::add-mask::$tok"
+          [ -z "$rtok" ] || echo "::add-mask::$rtok"
+          [ -n "$tok" ] || { echo "::error title=No repository token::Checkmate answered 200 without one."; exit 1; }
+          echo "token=$tok" >> "$GITHUB_OUTPUT"
+
+      - name: Push the branch and open the pull request
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          REPO: ${{ github.repository }}
+          BASE: ${{ github.event.repository.default_branch }}
+          BRANCH: ${{ needs.decide.outputs.branch }}
+          PACKAGE: ${{ needs.decide.outputs.package }}
+          ECOSYSTEM: ${{ needs.decide.outputs.ecosystem }}
+          LOCKFILE: ${{ needs.decide.outputs.lockfile }}
+          FROM: ${{ needs.decide.outputs.from }}
+          TO: ${{ needs.decide.outputs.to }}
+          REASON: ${{ needs.decide.outputs.reason }}
+          MANAGER: ${{ needs.decide.outputs.manager }}
+          REMOVE: ${{ needs.decide.outputs.remove }}
+          ROUNDS: ${{ needs.decide.outputs.rounds }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          [ "$BRANCH" != "$BASE" ] && [[ "$BRANCH" == lindamar/agent-fix-* ]] || { echo "::error::refusing to push to $BRANCH"; exit 1; }
+          dir="$(dirname "$LOCKFILE")"; where="${dir#.}"; where="${where:-the repository root}"
+          case "$REASON" in
+            consolidate_lockfiles)
+              title="Checkmate: Consolidate lockfiles in $where on $MANAGER"
+              what="Keeps \`$LOCKFILE\` and removes \`$REMOVE\`, pins \`packageManager\` to $MANAGER, and regenerates the kept lockfile with install scripts off."
+              message="deps: consolidate lockfiles on $MANAGER (Checkmate agent fix)" ;;
+            migrate_pnpm)
+              title="Checkmate: Migrate $where to pnpm"
+              what="Imports the existing lockfile into \`$LOCKFILE\` with pnpm import, removes \`$REMOVE\`, pins \`packageManager\` to pnpm, and adds \`.npmrc\` with \`minimum-release-age\` and \`only-built-dependencies\`."
+              message="deps: migrate to pnpm (Checkmate agent fix)" ;;
+            harden_scripts)
+              title="Checkmate: Turn off install scripts for $MANAGER in $where"
+              what="Keeps $MANAGER and turns dependency install scripts off in its settings file, with the install commands outside \`.github/\` changed to match."
+              message="deps: turn off install scripts for $MANAGER (Checkmate agent fix)" ;;
+            *)
+              title="Checkmate: Move $PACKAGE from $FROM to $TO with an agent"
+              what="Moves the $ECOSYSTEM package \`$PACKAGE\` from **$FROM** to **$TO** in \`$LOCKFILE\`."
+              message="deps: move $PACKAGE from $FROM to $TO (Checkmate agent fix)" ;;
+          esac
+          # Hooks off: nothing in the checkout runs while the token is in the environment.
+          git add -A
+          git -c core.hooksPath=/dev/null -c user.name="lindamar-reviewer[bot]" \
+            -c user.email="lindamar-reviewer[bot]@users.noreply.github.com" \
+            commit -q --no-verify -m "$message"
+          # The agent's own branch, rewritten on a second run; never the base.
+          git push -q --force "https://x-access-token:${GH_TOKEN}@github.com/$REPO.git" "HEAD:refs/heads/$BRANCH"
+
+          # The summary is the agent's; it is quoted as its words, capped, and
+          # carries no mentions or HTML.
+          summary="$(head -c 3000 "$RUNNER_TEMP/change/summary.md" 2>/dev/null | sed 's/@/@​/g; s/</\&lt;/g' || true)"
+          # Measured by the resolve job, not written by the agent.
+          lockfile_note="$(head -c 3000 "$RUNNER_TEMP/change/lockfile-note.md" 2>/dev/null || true)"
+          case "$REASON" in
+            yarn_v1_lockfile) why="\`$LOCKFILE\` is a Yarn 1 lockfile, which Checkmate's resolver does not regenerate, so the upgrade could not be opened automatically." ;;
+            lockfile_unsupported) why="\`$LOCKFILE\` is in a format Checkmate's resolver does not regenerate." ;;
+            transitive_no_override) why="\`$PACKAGE\` is transitive here, and the lockfile gives no override path to it." ;;
+            breaking_major) why="$TO is a new major version of \`$PACKAGE\`, so code that uses it may need to change with it." ;;
+            consolidate_lockfiles) why="\`$dir\` had more than one lockfile, which drift apart and are scanned twice. Checkmate read which package manager is in use from the repository and the signals agreed on $MANAGER." ;;
+            migrate_pnpm) why="An admin chose the pnpm migration from the Packages tab: pnpm runs no dependency install script unless it is listed, and waits \`minimum-release-age\` minutes before installing a new release." ;;
+            harden_scripts) why="An admin chose the lighter hardening from the Packages tab: dependency install scripts no longer run on install." ;;
+          esac
+          case "$REASON" in
+            consolidate_lockfiles) clean=""; check="Apply the \"CI changes\" in the agent's summary, if any, so CI installs with $MANAGER too." ;;
+            migrate_pnpm) clean=""; check="Apply the \"CI changes\" in the agent's summary (\`corepack enable\`, \`pnpm install --frozen-lockfile\`). If the build fails on a missing module, add \`node-linker=hoisted\` to \`.npmrc\`." ;;
+            harden_scripts) clean=""; check="Apply the \"CI changes\" in the agent's summary, and check the dependencies it lists as needing their install scripts still work." ;;
+            *) clean=" The target version is the one Checkmate's package-facts database checked clean."
+               check="Check that \`$LOCKFILE\` resolves \`$PACKAGE\` to exactly $TO." ;;
+          esac
+          # Written to a file, not `body="$(cat <<EOF ...)"`: a heredoc inside
+          # $( ) with apostrophes in it does not parse in every bash.
+          cat > "$RUNNER_TEMP/body.md" <<EOF
+          ## Checkmate
+
+          An admin asked Claude Code, from the Checkmate console, to resolve a suggestion Checkmate could not automate. Nothing was pushed to \`$BASE\`.
+
+          ## What changed
+
+          $what
+
+          $(git show --stat --format= HEAD | sed 's/^/    /')
+
+          ## Why
+
+          $why$clean
+
+          ${lockfile_note:+## The kept lockfile
+
+          $lockfile_note
+
+          }## The agent's summary
+
+          ${summary:-_The agent wrote no summary._}
+
+          ## Pre-review
+
+          Reviewed before this pull request opened, against Lindamar review's own rule skills and enumerators at the same reviewer ref; it opened only when that pre-review found nothing that blocks a merge.
+
+          $ROUNDS
+
+          <!-- checkmate-prereview passed -->
+
+          ## How to verify
+
+          1. Read the diff: an agent edited the manifests and code, and the package manager then regenerated the lockfile with install scripts off. This workflow refuses any change under \`.github/\`.
+          2. Install from the lockfile and run this repository's tests.
+          3. $check
+
+          ---
+          Opened by [Checkmate]($RUN_URL) with Claude Code, from the Checkmate console.
+          EOF
+          body="$(cat "$RUNNER_TEMP/body.md")"
+
+          owner="${REPO%%/*}"
+          existing="$(gh api "repos/$REPO/pulls?state=open&head=$owner:$BRANCH" --jq '.[0].number // empty')"
+          if [ -n "$existing" ]; then
+            number="$existing"
+            echo "  reusing #$number"
+          else
+            number="$(gh api -X POST "repos/$REPO/pulls" -f title="$title" -f head="$BRANCH" -f base="$BASE" \
+                        -f body="$body" -F maintainer_can_modify=true --jq .number)"
+            echo "  opened #$number"
+          fi
+
+          # Labels are cosmetic: a failure is a warning, never a failed run.
+          ensure_label() {  # name color description
+            gh api "repos/$REPO/labels/$1" >/dev/null 2>&1 \
+              || gh api -X POST "repos/$REPO/labels" -f name="$1" -f color="$2" -f description="$3" >/dev/null 2>&1 \
+              || echo "::warning::could not create the label $1"
+          }
+          ensure_label checkmate 5319e7 "Opened by Checkmate, the Lindamar supply-chain console"
+          ensure_label checkmate:agent-fix fbca04 "Checkmate: a change Claude Code made for a suggestion"
+          gh api -X POST "repos/$REPO/issues/$number/labels" -f "labels[]=checkmate" -f "labels[]=checkmate:agent-fix" \
+            >/dev/null 2>&1 || echo "::warning::could not label #$number"
+          echo "https://github.com/$REPO/pull/$number" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Revoke the write token
+        if: always() && steps.app.outputs.token != ''
+        env:
+          TOK: ${{ steps.app.outputs.token }}
+        run: |
+          code=$(curl -sS -o /dev/null -w '%{http_code}' -X DELETE \
+            -H "Authorization: Bearer $TOK" -H "Accept: application/vnd.github+json" \
+            https://api.github.com/installation/token || echo "000")
+          echo "revoke returned HTTP $code"

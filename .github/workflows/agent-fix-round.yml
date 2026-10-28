@@ -1,0 +1,863 @@
+name: Checkmate agent fix (one pass)
+
+# One pass of agent-fix.yml: the agent, the resolve job and the pre-review, as
+# three jobs with what each held in agent-fix.yml (see its header). Called
+# once per pass, at most three times, by agent-fix.yml, which alone publishes.
+
+on:
+  workflow_call:
+    inputs:
+      task:
+        type: string
+        required: true
+      round:
+        description: "Which pass this is, 1 to 3."
+        type: number
+        required: true
+      findings:
+        description: "The last pass's merge-blocking pre-review findings, as JSON: rule, file, line, title, fixPrompt; at most 20 and 8 KB. Empty on pass 1."
+        type: string
+        default: ""
+      spent:
+        description: "USD this dispatch has spent before this pass."
+        type: number
+        default: 0
+      cost-cap:
+        type: number
+        required: true
+      model:
+        type: string
+        required: true
+      timeout-minutes:
+        type: number
+        required: true
+      max-turns:
+        type: number
+        required: true
+    secrets:
+      ANTHROPIC_API_KEY:
+        required: false
+      CLAUDE_CODE_OAUTH_TOKEN:
+        required: false
+    outputs:
+      verdict:
+        description: "clean or critical, by the pre-review."
+        value: ${{ jobs.prereview.outputs.verdict }}
+      findings:
+        value: ${{ jobs.prereview.outputs.findings }}
+      cost:
+        value: ${{ jobs.prereview.outputs.cost }}
+      spent:
+        value: ${{ jobs.prereview.outputs.spent }}
+      package:
+        value: ${{ jobs.agent.outputs.package }}
+      ecosystem:
+        value: ${{ jobs.agent.outputs.ecosystem }}
+      lockfile:
+        value: ${{ jobs.agent.outputs.lockfile }}
+      from:
+        value: ${{ jobs.agent.outputs.from }}
+      to:
+        value: ${{ jobs.agent.outputs.to }}
+      reason:
+        value: ${{ jobs.agent.outputs.reason }}
+      branch:
+        value: ${{ jobs.agent.outputs.branch }}
+      manager:
+        value: ${{ jobs.agent.outputs.manager }}
+      remove:
+        value: ${{ jobs.agent.outputs.remove }}
+
+permissions:
+  contents: read
+
+# The Claude CLI, pinned. Unpinned, every run installed whatever npm called
+# latest that minute, which is how a new print-mode default (a 10-minute ceiling
+# on background sub-agents) reached the review unannounced (#73). 2.1.296 is the
+# version the green reviews of #72 and #68 ran on 2026-10-09. To move it, change
+# this line and the same line in review.yml; scripts/test-cli-pin.sh fails while they
+# disagree or while any install site is unpinned.
+env:
+  LINDAMAR_CLAUDE_CLI_VERSION: "2.1.296"
+
+jobs:
+  agent:
+    name: Checkmate agent fix (agent, pass ${{ inputs.round }})
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    permissions:
+      contents: read
+    outputs:
+      package: ${{ steps.task.outputs.package }}
+      ecosystem: ${{ steps.task.outputs.ecosystem }}
+      lockfile: ${{ steps.task.outputs.lockfile }}
+      from: ${{ steps.task.outputs.from }}
+      to: ${{ steps.task.outputs.to }}
+      reason: ${{ steps.task.outputs.reason }}
+      branch: ${{ steps.task.outputs.branch }}
+      manager: ${{ steps.task.outputs.manager }}
+      remove: ${{ steps.task.outputs.remove }}
+      cost: ${{ steps.fix.outputs.cost }}
+    steps:
+      - name: Stay under the cost cap
+        env:
+          SPENT: ${{ inputs.spent }}
+          CAP: ${{ inputs.cost-cap }}
+        run: |
+          set -euo pipefail
+          # A pass is not started once the dispatch has spent its cap.
+          if awk -v s="$SPENT" -v c="$CAP" 'BEGIN { exit !(s >= c) }'; then
+            echo "::error title=Checkmate cost cap::this dispatch has spent \$$SPENT of its \$$CAP cap; pass ${{ inputs.round }} was not started"
+            exit 1
+          fi
+
+      - name: Check the task
+        id: task
+        env:
+          TASK: ${{ inputs.task }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error title=Refused::$1"; exit 1; }
+          printf '%s' "$TASK" | jq -e 'type == "object"' >/dev/null 2>&1 || fail "the task is not a JSON object"
+          field() { printf '%s' "$TASK" | jq -r --arg k "$1" '.[$k] // "" | if type == "string" then . else "" end'; }
+          package="$(field package)"; ecosystem="$(field ecosystem)"; lockfile="$(field lockfile)"
+          from="$(field from)"; to="$(field to)"; reason="$(field reason)"; slug="$(field slug)"
+          manager="$(field manager)"; remove=""
+          path_ok() {
+            [[ "$1" =~ ^[A-Za-z0-9._][A-Za-z0-9._/-]{0,199}$ ]] || return 1
+            case "/$1/" in */../*|*/./*|*//*|/.github/*) return 1 ;; esac
+          }
+          path_ok "$lockfile" || fail "lockfile is not a plain repository path"
+          [[ "$slug" =~ ^[a-z0-9][a-z0-9-]{0,79}$ ]] || fail "slug must be lowercase letters, digits and dashes"
+          case "$reason" in
+            yarn_v1_lockfile|lockfile_unsupported|transitive_no_override|breaking_major)
+              # One package, from one version to another.
+              case "$ecosystem" in
+                npm)  [[ "$package" =~ ^(@[a-z0-9][a-z0-9._~-]{0,100}/)?[a-z0-9][a-z0-9._~-]{0,213}$ ]] || fail "package is not an npm name" ;;
+                pypi) [[ "$package" =~ ^[A-Za-z0-9]([A-Za-z0-9._-]{0,98}[A-Za-z0-9])?$ ]] || fail "package is not a PyPI name" ;;
+                *) fail "ecosystem must be npm or pypi" ;;
+              esac
+              for v in "$from" "$to"; do
+                [[ "$v" =~ ^[0-9A-Za-z][0-9A-Za-z.+_-]{0,63}$ ]] || fail "a version is not a version"
+              done
+              [ -z "$manager" ] || fail "manager belongs to a package-manager task" ;;
+            consolidate_lockfiles|migrate_pnpm|harden_scripts)
+              # One directory's package manager: which one, the lockfile it keeps
+              # (or, for pnpm, will write) and the lockfiles that go.
+              [ "$ecosystem" = npm ] || fail "a package-manager task is for npm projects"
+              [ -z "$package$from$to" ] || fail "package, from and to belong to a package task"
+              case "$manager" in npm) own=package-lock.json ;; yarn) own=yarn.lock ;; pnpm) own=pnpm-lock.yaml ;;
+                *) fail "manager must be npm, yarn or pnpm" ;; esac
+              [ "$(basename "$lockfile")" = "$own" ] || fail "$manager's lockfile is $own, not $(basename "$lockfile")"
+              printf '%s' "$TASK" | jq -e '(.remove // []) | type == "array" and length <= 3 and all(type == "string")' \
+                >/dev/null || fail "remove must be a list of at most three paths"
+              while IFS= read -r r; do
+                [ -n "$r" ] || continue
+                path_ok "$r" || fail "a path to remove is not a plain repository path"
+                [ "$(dirname "$r")" = "$(dirname "$lockfile")" ] || fail "$r is not beside $lockfile"
+                [ "$r" != "$lockfile" ] || fail "the kept lockfile cannot also be removed"
+                case "$(basename "$r")" in package-lock.json|npm-shrinkwrap.json|yarn.lock|pnpm-lock.yaml) ;;
+                  *) fail "$r is not a JS lockfile" ;; esac
+                remove="$remove $r"
+              done < <(printf '%s' "$TASK" | jq -r '(.remove // [])[]')
+              remove="${remove# }"
+              case "$reason" in
+                consolidate_lockfiles) [ -n "$remove" ] || fail "consolidating removes at least one lockfile" ;;
+                migrate_pnpm) [ "$manager" = pnpm ] && [ -n "$remove" ] || fail "a pnpm migration keeps pnpm and removes the old lockfile" ;;
+                harden_scripts) [ "$manager" != pnpm ] && [ -z "$remove" ] || fail "hardening is for npm or Yarn, and removes nothing" ;;
+              esac ;;
+            *) fail "reason is not one Checkmate sends" ;;
+          esac
+          branch="lindamar/agent-fix-$slug"
+          [ "$branch" != "$DEFAULT_BRANCH" ] || fail "the branch would be the default branch"
+          {
+            echo "package=$package"; echo "ecosystem=$ecosystem"; echo "lockfile=$lockfile"
+            echo "from=$from"; echo "to=$to"; echo "reason=$reason"; echo "branch=$branch"
+            echo "manager=$manager"; echo "remove=$remove"
+          } >> "$GITHUB_OUTPUT"
+          if [ -n "$manager" ]; then echo "  $reason: $manager, $lockfile${remove:+, removing $remove}, on $branch"
+          else echo "  $package $from -> $to in $lockfile ($reason), on $branch"; fi
+
+
+      - name: Pick the Claude credential
+        env:
+          API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OAUTH: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          # The API key when there is one, as the review does by default;
+          # otherwise the subscription token. Names only, never a value.
+          if [ -n "${API_KEY:-}" ]; then echo "  using ANTHROPIC_API_KEY"
+          elif [ -n "${OAUTH:-}" ]; then echo "  using CLAUDE_CODE_OAUTH_TOKEN"
+          else
+            echo "::error title=No Claude credential::Set ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN on this repository or its organization."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install the Claude CLI
+        run: |
+          npm install -g "@anthropic-ai/claude-code@${LINDAMAR_CLAUDE_CLI_VERSION}"
+          claude --version
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: checkmate-skills-${{ github.run_id }}
+          path: ${{ runner.temp }}/skills
+
+      - name: Fix
+        id: fix
+        env:
+          FINDINGS: ${{ inputs.findings }}
+          ROUND: ${{ inputs.round }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.ANTHROPIC_API_KEY == '' && secrets.CLAUDE_CODE_OAUTH_TOKEN || '' }}
+          PACKAGE: ${{ steps.task.outputs.package }}
+          ECOSYSTEM: ${{ steps.task.outputs.ecosystem }}
+          LOCKFILE: ${{ steps.task.outputs.lockfile }}
+          FROM: ${{ steps.task.outputs.from }}
+          TO: ${{ steps.task.outputs.to }}
+          REASON: ${{ steps.task.outputs.reason }}
+          MANAGER: ${{ steps.task.outputs.manager }}
+          REMOVE: ${{ steps.task.outputs.remove }}
+          MODEL: ${{ inputs.model }}
+          MAX_TURNS: ${{ inputs.max-turns }}
+        run: |
+          set -uo pipefail
+          case "$REASON" in
+            yarn_v1_lockfile) why="$LOCKFILE is a Yarn 1 lockfile, which Checkmate's resolver does not regenerate. Move this project to Yarn 4: set \"packageManager\": \"yarn@4.9.2\" in package.json, add a .yarnrc.yml with nodeLinker: node-modules, add .yarn/cache and .yarn/install-state.gz to .gitignore, and set $PACKAGE's constraint so it resolves $TO." ;;
+            lockfile_unsupported) why="$LOCKFILE is in a lockfile format Checkmate's resolver does not regenerate. Set $PACKAGE's constraint in the manifest so the package manager this project uses resolves $TO." ;;
+            transitive_no_override) why="$PACKAGE is a transitive dependency and this lockfile gives no override path to it. Raise the constraint of the direct dependency that brings it in to a release that allows $PACKAGE $TO, or add the package manager's own constraint mechanism, whichever changes less." ;;
+            breaking_major) why="$TO is a new major version of $PACKAGE. Set its constraint to $TO, then change this repository's code where it uses an API that changed between $FROM and $TO." ;;
+          esac
+          dir="$(dirname "$LOCKFILE")"
+          case "$REASON" in
+            consolidate_lockfiles)
+              task="$dir has more than one lockfile, and $MANAGER is the package manager in use. After you finish, this workflow removes $REMOVE, pins packageManager to $MANAGER and regenerates $LOCKFILE; do not do those yourself.
+          Your part: change every reference to another package manager in this repository, outside .github/, to $MANAGER: package.json scripts, the Dockerfile, vercel.json, and install instructions in the README or docs." ;;
+            migrate_pnpm)
+              task="Move $dir to pnpm. After you finish, this workflow pins packageManager to pnpm, imports the existing lockfile with pnpm import, removes $REMOVE and regenerates $LOCKFILE; do not do those yourself.
+          Your part: write $dir/.npmrc with minimum-release-age=1440 and one only-built-dependencies[]=<name> line for each dependency that needs its install script to work (for example esbuild, sharp, prisma; none if none does). If the project relies on hoisting (React Native, older Next.js, a bundler that resolves undeclared dependencies), add node-linker=hoisted and say why in the summary. Change the Dockerfile to corepack enable and pnpm install --frozen-lockfile, vercel.json's installCommand to pnpm install, and package.json scripts that call npm or yarn to pnpm." ;;
+            harden_scripts)
+              task="Keep $MANAGER in $dir, and turn off dependency install scripts. After you finish, this workflow writes the setting ($MANAGER: .npmrc ignore-scripts=true, .yarnrc --ignore-scripts true, or .yarnrc.yml enableScripts: false); do not write it yourself.
+          Your part: add --ignore-scripts to the install commands in the Dockerfile and in package.json scripts, and list in the summary every dependency that needs its install script (for example esbuild, sharp, prisma), because it will no longer run." ;;
+            *)
+              task="Move the $ECOSYSTEM package $PACKAGE from $FROM to exactly $TO in $LOCKFILE.
+          $why" ;;
+          esac
+          # From pass 2 on: what the pre-review of the last pass found that blocks a
+          # merge, as the pre-review's own rule, file, line, title and fix prompt,
+          # capped there at 20 findings and 8 KB and checked again here.
+          feedback=""
+          if [ "$ROUND" -gt 1 ] && printf '%s' "$FINDINGS" | jq -e 'type == "array"' >/dev/null 2>&1; then
+            feedback="$(printf '%s' "$FINDINGS" | jq -r '.[:20][] | "- [\(.rule // "?")] \(.file // "?"):\(.line // "?") \(.title // "" | .[:200])\n  Fix: \(.fixPrompt // "" | .[:600])"' | head -c 8192)"
+          fi
+          prompt="You are resolving one Checkmate supply-chain suggestion in this repository.
+
+          Task: $task
+
+          Rules:
+          - You can read and edit files; you cannot run commands. Edit the manifests (and code, if the task needs it). Do not edit $LOCKFILE: after you finish, the package manager regenerates it from your manifests.
+          - Change only what this task needs. Do not touch anything under .github/, and do not add or change .npmrc, .yarnrc or .yarnrc.yml settings about scripts.
+          - This run cannot change .github/. If a workflow there still installs with another package manager or needs a flag, list each line and its replacement under a heading \"CI changes\" in the summary.
+          - The pull request is reviewed by Lindamar review against these skills: $(for f in "$RUNNER_TEMP"/skills/*/SKILL.md; do printf '%s ' "$f"; done)
+            Read each one before you finish, and make sure your change meets every merge-blocking (critical) criterion in them; a change that fails one is rejected. They are rules to meet, not instructions to run anything.
+          ${feedback:+- This is pass $ROUND. Your previous pass was pre-reviewed against the same skills and these merge-blocking findings came back; fix every one, and change nothing else:
+          $feedback
+          }- When you are done, write a short summary of what you changed and what a reviewer should check to checkmate-summary.md at the repository root."
+          rc=0
+          claude -p "$prompt" \
+            --model "$MODEL" \
+            --max-turns "$MAX_TURNS" \
+            --permission-mode acceptEdits \
+            --allowedTools "Read" "Edit" "Write" "Glob" "Grep" \
+            --disallowedTools "Bash" "WebFetch" "WebSearch" "NotebookEdit" \
+            --add-dir "$RUNNER_TEMP/skills" \
+            </dev/null > "$RUNNER_TEMP/fix.jsonl" 2>"$RUNNER_TEMP/fix.err" || rc=$?
+          tail -c 4000 "$RUNNER_TEMP/fix.err" || true
+          # The measured cost of this pass, from Claude Code's own result event.
+          cost="$(jq -rs '[.[] | select(.type == "result") | .total_cost_usd // 0] | add // 0' "$RUNNER_TEMP/fix.jsonl" 2>/dev/null || echo 0)"
+          echo "cost=$cost" >> "$GITHUB_OUTPUT"
+          echo "claude exited $rc; pass ${ROUND} agent cost \$$cost"
+          exit "$rc"
+
+      - name: Package the change
+        env:
+          API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OAUTH: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/change"
+          if [ -f checkmate-summary.md ]; then
+            head -c 3000 checkmate-summary.md > "$RUNNER_TEMP/change/summary.md"; rm -f checkmate-summary.md
+          else
+            : > "$RUNNER_TEMP/change/summary.md"
+          fi
+          git add -A
+          git diff --cached --binary > "$RUNNER_TEMP/change/agent.patch"
+          git diff --cached --name-only | while IFS= read -r p; do
+            case "$p" in .github/*) echo "::error title=Refused::the agent changed $p, under .github"; exit 1 ;; esac
+          done
+          # To a file first, never `git diff | grep -q`: grep stops at the first
+          # match, git diff takes SIGPIPE on a large diff, and under pipefail
+          # that match would read as "not found".
+          for v in "${API_KEY:-}" "${OAUTH:-}"; do
+            [ -n "$v" ] || continue
+            if grep -qF -- "$v" "$RUNNER_TEMP/change/agent.patch" || grep -qF -- "$v" "$RUNNER_TEMP/change/summary.md"; then
+              echo "::error title=Refused::the change carries the Claude credential; nothing was pushed"; exit 1
+            fi
+          done
+          git diff --cached --stat | tail -1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: checkmate-agent-${{ github.run_id }}-r${{ inputs.round }}
+          path: ${{ runner.temp }}/change
+          retention-days: 1
+
+  resolve:
+    name: Checkmate agent fix (lockfile, pass ${{ inputs.round }})
+    needs: agent
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    # No `secrets.` anywhere in this job: install scripts are off, and if one
+    # ran anyway there is no credential here for it to read.
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: checkmate-agent-${{ github.run_id }}-r${{ inputs.round }}
+          path: ${{ runner.temp }}/change
+
+      - name: Apply the agent's change
+        run: |
+          set -euo pipefail
+          patch="$RUNNER_TEMP/change/agent.patch"
+          if [ -s "$patch" ]; then
+            git apply --numstat "$patch" | cut -f3 | while IFS= read -r p; do
+              case "$p" in .github/*|.git/*|*/.git/*) echo "::error title=Refused::the patch touches $p"; exit 1 ;; esac
+            done
+            git apply --index "$patch"
+          fi
+
+      - uses: actions/setup-node@v4
+        if: needs.agent.outputs.ecosystem == 'npm'
+        with:
+          node-version: "22"
+
+      - uses: astral-sh/setup-uv@v6
+        if: needs.agent.outputs.ecosystem == 'pypi'
+
+      - name: Regenerate the lockfile
+        env:
+          LOCKFILE: ${{ needs.agent.outputs.lockfile }}
+          REASON: ${{ needs.agent.outputs.reason }}
+          MANAGER: ${{ needs.agent.outputs.manager }}
+          REMOVE: ${{ needs.agent.outputs.remove }}
+          npm_config_ignore_scripts: "true"
+          YARN_ENABLE_SCRIPTS: "false"
+          UV_NO_BUILD: "1"
+          COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+        run: |
+          set -euo pipefail
+          # Install scripts off on each command line: that wins over any rc
+          # file the repository or the agent wrote. The environment above and
+          # the user's rc files below are a second layer, not the first.
+          printf -- '--ignore-scripts true\n' >> "$HOME/.yarnrc"
+          printf 'ignore-scripts=true\n' >> "$HOME/.npmrc"
+          dir="$(dirname "$LOCKFILE")"; base="$(basename "$LOCKFILE")"
+          # The package-manager tasks' own steps, done here and not by the agent:
+          # which files go, what packageManager says, and the scripts setting.
+          pin() {  # pin <manager>@<version>: unless package.json already names that manager
+            case "$(jq -r '.packageManager // ""' package.json)" in "${1%%@*}"@*) ;; *) npm pkg set "packageManager=$1" ;; esac
+          }
+          berry() { grep -q '^__metadata:' yarn.lock 2>/dev/null || case "$(jq -r '.packageManager // ""' package.json)" in yarn@1.*|"") false ;; yarn@*) true ;; *) false ;; esac; }
+          case "$REASON" in
+            harden_scripts)
+              cd "$dir"
+              case "$MANAGER" in
+                npm) grep -qx 'ignore-scripts=true' .npmrc 2>/dev/null || printf 'ignore-scripts=true\n' >> .npmrc ;;
+                yarn)
+                  if berry; then
+                    grep -q '^enableScripts:' .yarnrc.yml 2>/dev/null && sed -i 's/^enableScripts:.*/enableScripts: false/' .yarnrc.yml \
+                      || printf 'enableScripts: false\n' >> .yarnrc.yml
+                  else
+                    grep -qx -- '--ignore-scripts true' .yarnrc 2>/dev/null || printf -- '--ignore-scripts true\n' >> .yarnrc
+                  fi ;;
+              esac
+              exit 0 ;;
+            migrate_pnpm)
+              cd "$dir"
+              pin pnpm@10.34.6
+              corepack enable
+              # Import keeps the resolved versions the old lockfile recorded.
+              pnpm import
+              for r in $REMOVE; do rm -f -- "$(basename "$r")"; done
+              grep -q '^minimum-release-age=' .npmrc 2>/dev/null || printf 'minimum-release-age=1440\n' >> .npmrc
+              pnpm install --lockfile-only --ignore-scripts
+              exit 0 ;;
+            consolidate_lockfiles)
+              for r in $REMOVE; do rm -f -- "$r"; done
+              cd "$dir"
+              case "$MANAGER" in
+                npm) pin "npm@$(npm --version)" ;;
+                yarn) if berry; then pin yarn@4.9.2; else pin yarn@1.22.22; fi ;;
+                pnpm) pin pnpm@10.34.6 ;;
+              esac
+              cd - >/dev/null ;;
+          esac
+          cd "$dir"
+          case "$base" in
+            package-lock.json)
+              npm install --package-lock-only --ignore-scripts --no-audit --no-fund ;;
+            pnpm-lock.yaml)
+              corepack enable
+              pm="$(jq -r '.packageManager // ""' package.json)"
+              case "$pm" in
+                pnpm@*) pnpm install --lockfile-only --ignore-scripts ;;
+                # Pinned when the project names none: corepack's "latest" can be
+                # a release its own bundled version cannot unpack.
+                *) corepack pnpm@10.34.6 install --lockfile-only --ignore-scripts ;;
+              esac ;;
+            yarn.lock)
+              corepack enable
+              pm="$(jq -r '.packageManager // ""' package.json)"
+              case "$pm" in
+                ""|yarn@1.*)
+                  corepack yarn@1.22.22 install --ignore-scripts --non-interactive --no-progress ;;
+                yarn@*)
+                  # Yarn 2+: resolve and write the lockfile only; no link step, so no build.
+                  yarn install --mode=update-lockfile ;;
+                *) echo "::error::package.json names $pm, not Yarn"; exit 1 ;;
+              esac ;;
+            uv.lock)
+              uv lock --no-build ;;
+            *.txt)
+              if [ -f "${base%.txt}.in" ]; then
+                uv pip compile "${base%.txt}.in" -o "$base" --generate-hashes --no-build
+              else
+                echo "  $base is not compiled from a .in file: the agent's edit is the change"
+              fi ;;
+            *) echo "::error::no resolver for $base"; exit 1 ;;
+          esac
+
+      # INFOSEC-1178, layer 2: what the review would reject for certain, checked
+      # here, where there is no secret and no model cost. Any failure: no pull
+      # request, and the reason is the run's error annotation.
+      - name: Check the change before a pull request
+        env:
+          LOCKFILE: ${{ needs.agent.outputs.lockfile }}
+          REASON: ${{ needs.agent.outputs.reason }}
+          PACKAGE: ${{ needs.agent.outputs.package }}
+          FROM: ${{ needs.agent.outputs.from }}
+          TO: ${{ needs.agent.outputs.to }}
+          npm_config_ignore_scripts: "true"
+          YARN_ENABLE_SCRIPTS: "false"
+          UV_NO_BUILD: "1"
+          COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+        run: |
+          set -euo pipefail
+          fail() {
+            echo "::error title=Checkmate check failed::$1"
+            printf '%s\n' "$1" >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+            # The reason, for the console: the failure artifact and the annotation say the same.
+            mkdir -p "$RUNNER_TEMP/failure"; printf '%s\n' "$1" > "$RUNNER_TEMP/failure/failure.txt"
+            exit 1
+          }
+          dir="$(dirname "$LOCKFILE")"; base="$(basename "$LOCKFILE")"
+          # 1. One JS lockfile per directory: two drift, and the review flags the stale one.
+          n=0
+          for f in package-lock.json npm-shrinkwrap.json yarn.lock pnpm-lock.yaml; do [ -f "$dir/$f" ] && n=$((n + 1)); done
+          [ "$n" -le 1 ] || fail "$dir has $n JS lockfiles; consolidate them first (Consolidate lockfiles)"
+          # 2. Nothing under .github/ (the packaging step checks the staged change too).
+          ! git status --porcelain -- .github | grep -q . || fail "the change touches .github/"
+          # 3. A frozen install from the lockfile passes, as CI's would, with no script run.
+          (
+            cd "$dir"
+            pm="$(jq -r '.packageManager // ""' package.json 2>/dev/null || true)"
+            case "$base" in
+              package-lock.json|npm-shrinkwrap.json)
+                npm ci --dry-run --ignore-scripts --no-audit --no-fund ;;
+              yarn.lock)
+                corepack enable
+                if grep -q '^__metadata:' yarn.lock || case "$pm" in yarn@1.*|"") false ;; yarn@*) true ;; *) false ;; esac; then
+                  yarn install --immutable --mode=skip-build
+                else
+                  corepack yarn@1.22.22 install --frozen-lockfile --ignore-scripts --non-interactive --no-progress
+                fi ;;
+              pnpm-lock.yaml)
+                corepack enable
+                case "$pm" in pnpm@*) pnpm install --frozen-lockfile --lockfile-only --ignore-scripts ;;
+                  *) corepack pnpm@10.34.6 install --frozen-lockfile --lockfile-only --ignore-scripts ;; esac ;;
+              uv.lock) uv lock --check ;;
+              *) true ;;
+            esac
+          ) || fail "a frozen install from $LOCKFILE fails: the lockfile does not match its manifest"
+          # 4. For a package task, the target version resolves in every lockfile
+          #    that has the package, and the version it moves from is in none.
+          if [ -n "$PACKAGE" ]; then
+            git ls-files -co --exclude-standard | grep -E '(^|/)(package-lock\.json|npm-shrinkwrap\.json|yarn\.lock|pnpm-lock\.yaml|uv\.lock|requirements[^/]*\.txt)$' \
+              | grep -v '/node_modules/' > "$RUNNER_TEMP/lockfiles.txt" || true
+            # The list is an argument: stdin is this script, and a second "<" would be dropped.
+            python3 - "$PACKAGE" "$FROM" "$TO" "$LOCKFILE" "$RUNNER_TEMP/lockfiles.txt" <<'PY' || fail "$(cat "$RUNNER_TEMP/check.err" 2>/dev/null || echo "the target version does not resolve")"
+          import json, os, re, sys
+          name, old, new, target, listing = sys.argv[1:6]
+          def versions(path):
+              text = open(path, encoding="utf-8", errors="replace").read()
+              base = os.path.basename(path)
+              found = set()
+              if base in ("package-lock.json", "npm-shrinkwrap.json"):
+                  data = json.loads(text)
+                  packages = data.get("packages") or {}
+                  for key, entry in packages.items():
+                      if not (key.endswith("node_modules/" + name) and isinstance(entry, dict)):
+                          continue
+                      if entry.get("link") and isinstance(packages.get(entry.get("resolved")), dict):
+                          entry = packages[entry["resolved"]]  # a linked package: its version is at its own path
+                      if entry.get("version"):
+                          found.add(entry["version"])
+                  def walk(deps):
+                      for dep, entry in (deps or {}).items():
+                          if dep == name and isinstance(entry, dict) and entry.get("version"):
+                              found.add(entry["version"])
+                          walk((entry or {}).get("dependencies"))
+                  walk(data.get("dependencies"))
+              elif base == "yarn.lock":
+                  header = None
+                  for line in text.splitlines():
+                      if line and not line.startswith((" ", "#")):
+                          header = [h.strip().strip('"') for h in line.rstrip(":").split(",")]
+                      elif header and re.match(r'^\s+version:?\s', line):
+                          # "name@range", "@scope/name@range", "name@npm:range": the name ends at the
+                          # first "@" after the first character.
+                          if any(h[:h.index("@", 1)] == name for h in header if "@" in h[1:]):
+                              found.add(re.sub(r'^\s+version:?\s+"?([^"\s]+)"?.*$', r"\1", line))
+                          header = None
+              elif base == "pnpm-lock.yaml":
+                  for m in re.finditer(r"^\s{2}'?(@?[^@\s':]+)@([0-9][^(:'\s]*)", text, re.M):
+                      if m.group(1) == name:
+                          found.add(m.group(2))
+              elif base == "uv.lock":
+                  for m in re.finditer(r'\[\[package\]\]\s*\nname = "([^"]+)"\s*\nversion = "([^"]+)"', text):
+                      if m.group(1).lower() == name.lower():
+                          found.add(m.group(2))
+              else:
+                  for m in re.finditer(r"^\s*([A-Za-z0-9._-]+)==([^\s;#\\]+)", text, re.M):
+                      if m.group(1).lower().replace("_", "-") == name.lower().replace("_", "-"):
+                          found.add(m.group(2))
+              return found
+          problems = []
+          paths = [line.strip() for line in open(listing) if line.strip()]
+          if target not in paths and os.path.exists(target):
+              paths.append(target)
+          for path in paths:
+              got = versions(path)
+              if path == target and new not in got:
+                  problems.append(f"{path} does not resolve {name} to {new} (it has {', '.join(sorted(got)) or 'none'})")
+              elif got and old != new and old in got:
+                  problems.append(f"{path} still resolves {name} {old}")
+          if problems:
+              open(os.path.join(os.environ.get("RUNNER_TEMP", "/tmp"), "check.err"), "w").write("; ".join(problems))
+              sys.exit(1)
+          PY
+          fi
+          echo "  checks passed"
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: checkmate-failure-${{ github.run_id }}-r${{ inputs.round }}
+          path: ${{ runner.temp }}/failure
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Package the resolved change
+        env:
+          LOCKFILE: ${{ needs.agent.outputs.lockfile }}
+          REASON: ${{ needs.agent.outputs.reason }}
+        run: |
+          set -euo pipefail
+          # A consolidation keeps a lockfile; say what regenerating it did to it,
+          # measured here, so the pull request does not leave a reader to guess
+          # at a large diff: dependencies package.json asked for that it lacked,
+          # entries added, and versions already in it that changed.
+          if [ "$REASON" = consolidate_lockfiles ] && [ -f "$LOCKFILE" ] && \
+             case "$(basename "$LOCKFILE")" in package-lock.json|npm-shrinkwrap.json) true ;; *) false ;; esac; then
+            manifest="$(dirname "$LOCKFILE")/package.json"
+            git show "HEAD:$LOCKFILE" > "$RUNNER_TEMP/lock.before" 2>/dev/null || : > "$RUNNER_TEMP/lock.before"
+            git show "HEAD:$manifest" > "$RUNNER_TEMP/manifest.before" 2>/dev/null || : > "$RUNNER_TEMP/manifest.before"
+            python3 - "$RUNNER_TEMP/lock.before" "$LOCKFILE" "$RUNNER_TEMP/manifest.before" "$(basename "$LOCKFILE")" \
+              > "$RUNNER_TEMP/change/lockfile-note.md" <<'PY'
+          import json, sys
+          def load(path):
+              try:
+                  return json.load(open(path))
+              except (OSError, ValueError):
+                  return {}
+          before, after, manifest, name = load(sys.argv[1]), load(sys.argv[2]), load(sys.argv[3]), sys.argv[4]
+          FIELDS = ("dependencies", "devDependencies", "optionalDependencies", "peerDependencies")
+          def by_name(entry):
+              """name → {field: spec}, over the four fields npm copies into packages[""]."""
+              out = {}
+              for field in FIELDS:
+                  specs = entry.get(field) if isinstance(entry, dict) else None
+                  for dep, spec in (specs.items() if isinstance(specs, dict) else ()):
+                      out.setdefault(dep, {})[field] = spec
+              return out
+          asked = by_name(manifest)
+          def names(items):
+              items = sorted(items)
+              return ", ".join(f"`{d}`" for d in items[:10]) + (f" and {len(items) - 10} more" if len(items) > 10 else "")
+          lines = []
+          # Only a lockfile with a `packages` map (lockfileVersion 2 or 3) records what
+          # package.json asked for and each entry's version. Anything else (version 1,
+          # or no lockfile at HEAD) cannot be compared: say so, and count nothing,
+          # rather than print zeros that measured nothing.
+          if not isinstance(before.get("packages"), dict) or not isinstance(before["packages"].get(""), dict):
+              version = before.get("lockfileVersion")
+              was = f"lockfileVersion {version}" if version else "not there, or not readable"
+              if isinstance(after.get("packages"), dict):
+                  lines.append(f"`{name}` at the base was {was}, which records no per-entry versions to compare, so "
+                               f"what regenerating it changed is not measured here: read the diff.")
+          else:
+              # One verdict per dependency NAME, whatever fields package.json lists it in:
+              #   ok       some field records it with the range package.json gives there
+              #            (npm moves a dep listed in both dependencies and
+              #            optionalDependencies to optionalDependencies alone)
+              #   missing  no field of packages[""] records it
+              #   drifted  a field package.json lists it in records another range
+              #   moved    recorded only under fields package.json does not list it in
+              # Workspace members' own package.json are packages["<path>"], not the
+              # root, and are not judged here.
+              recorded = by_name(before["packages"][""])
+              missing, moved, drifted = [], [], []
+              for dep, fields in sorted(asked.items()):
+                  there = recorded.get(dep, {})
+                  if any(there.get(f) == spec for f, spec in fields.items()):
+                      continue
+                  if not there:
+                      missing.append(dep)
+                  elif any(f in there for f in fields):
+                      drifted.append(dep)
+                  else:
+                      moved.append(dep)
+              old = {k: v.get("version") for k, v in before["packages"].items() if isinstance(v, dict)}
+              new = {k: v.get("version") for k, v in (after.get("packages") or {}).items() if isinstance(v, dict)}
+              changed = sorted(k for k in old if k in new and old[k] != new[k])
+              added = [k for k in new if k not in old]
+              removed = [k for k in old if k not in new]
+              if missing:
+                  lines.append(f"`{name}` was missing {len(missing)} of the dependencies package.json asks for "
+                               f"({names(missing)}); regenerating it adds them and what they depend on.")
+              if moved:
+                  lines.append(f"`{name}` recorded {len(moved)} under another field than package.json lists them in "
+                               f"({names(moved)}); regenerating it follows package.json.")
+              if drifted:
+                  lines.append(f"`{name}` recorded {len(drifted)} with a different range than package.json asks for "
+                               f"({names(drifted)}); regenerating it follows package.json.")
+              if missing or moved or drifted or changed or added or removed:
+                  lines.append(f"Entries added: {len(added)}. Removed: {len(removed)}. "
+                               f"Versions already in it that changed: {len(changed)}"
+                               + (": " + ", ".join(f"`{k.removeprefix('node_modules/')}` {old[k]} → {new[k]}" for k in changed[:10])
+                                  if changed else "") + ".")
+          if lines:
+              print("\n\n".join(lines))
+          PY
+          fi
+          # What an install leaves behind is not the change.
+          find . -name node_modules -type d -prune -exec rm -rf {} +
+          rm -rf .yarn/cache .yarn/install-state.gz .yarn/unplugged .pnp.cjs .pnp.loader.mjs
+          git add -A
+          [ -n "$(git diff --cached --name-only)" ] || { echo "::error title=No change::nothing to propose"; exit 1; }
+          git diff --cached --name-only | while IFS= read -r p; do
+            case "$p" in .github/*) echo "::error title=Refused::$p is under .github"; exit 1 ;; esac
+          done
+          git diff --cached --binary > "$RUNNER_TEMP/change/resolved.patch"
+          git diff --cached --stat | tail -1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: checkmate-resolved-${{ github.run_id }}-r${{ inputs.round }}
+          path: ${{ runner.temp }}/change
+          retention-days: 1
+
+  # INFOSEC-1178, layer 3: the pre-publish self-review. The resolved change is
+  # reviewed against the same rule skills, by the same enumerators, from the
+  # same reviewer ref as Lindamar review; its merge-blocking findings go back to
+  # the agent for another pass, or the pull request opens only when there are
+  # none. This job holds the Claude credential and no GitHub token: GitHub is
+  # never called, and the enumerators read a local repository through
+  # scripts/lib/gh-local.py instead of `gh api`.
+  #
+  # Known trade-off: this is the review's rules and inventory run locally, not
+  # lindamar-review-pr itself, which reads and posts to a pull request. Where
+  # it passes and Lindamar review then rejects, the console records a
+  # prereview_miss; if those appear, the next step is a local-diff mode in
+  # lindamar-review-pr.
+  prereview:
+    name: Checkmate agent fix (pre-review, pass ${{ inputs.round }})
+    needs: [agent, resolve]
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    permissions:
+      contents: read
+    outputs:
+      verdict: ${{ steps.verdict.outputs.verdict }}
+      findings: ${{ steps.verdict.outputs.findings }}
+      cost: ${{ steps.verdict.outputs.cost }}
+      spent: ${{ steps.verdict.outputs.spent }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+          path: target
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: checkmate-resolved-${{ github.run_id }}-r${{ inputs.round }}
+          path: ${{ runner.temp }}/change
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: checkmate-skills-${{ github.run_id }}
+          path: ${{ runner.temp }}/skills
+
+      - name: Commit the proposed change locally
+        id: local
+        working-directory: target
+        run: |
+          set -euo pipefail
+          patch="$RUNNER_TEMP/change/resolved.patch"
+          git apply --numstat "$patch" | cut -f3 | while IFS= read -r p; do
+            case "$p" in .github/*|.git/*|*/.git/*) echo "::error title=Refused::the patch touches $p"; exit 1 ;; esac
+          done
+          echo "base=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          git apply --index "$patch"
+          git -c core.hooksPath=/dev/null -c user.name=checkmate -c user.email=checkmate@localhost \
+            commit -q --no-verify -m "checkmate pre-review"
+          echo "head=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          git diff HEAD~1 HEAD > "$RUNNER_TEMP/change/proposed.diff"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Run the review's enumerators on the change
+        env:
+          REPO: ${{ github.repository }}
+          CHECKMATE_LOCAL: ${{ github.workspace }}/target
+          CHECKMATE_BASE: ${{ steps.local.outputs.base }}
+          CHECKMATE_HEAD: ${{ steps.local.outputs.head }}
+          GH_TOKEN: ""
+        run: |
+          set -euo pipefail
+          reviewer="$RUNNER_TEMP/skills/.reviewer"
+          mkdir -p "$RUNNER_TEMP/shim" "$RUNNER_TEMP/inventory"
+          ln -sf "$reviewer/scripts/lib/gh-local.py" "$RUNNER_TEMP/shim/gh"
+          chmod +x "$reviewer"/scripts/*.sh "$reviewer/scripts/lib/gh-local.py"
+          export PATH="$RUNNER_TEMP/shim:$PATH"
+          run() {  # run <name> <script> [args]: the enumerator's own output, or the job fails naming it
+            local name="$1"; shift
+            if ! "$@" > "$RUNNER_TEMP/inventory/$name.json" 2> "$RUNNER_TEMP/inventory/$name.err"; then
+              sleep 5
+              "$@" > "$RUNNER_TEMP/inventory/$name.json" 2> "$RUNNER_TEMP/inventory/$name.err" || {
+                echo "::error title=Pre-review could not run::$name failed: $(tail -c 300 "$RUNNER_TEMP/inventory/$name.err")"; exit 1; }
+            fi
+          }
+          run candidates bash "$reviewer/scripts/enumerate-candidates.sh" --repo "$REPO" --pr 1 --ref "$CHECKMATE_HEAD"
+          run dependencies bash "$reviewer/scripts/enumerate-dependencies.sh" --repo "$REPO" --pr 1
+          run shell bash "$reviewer/scripts/enumerate-shell.sh" --repo "$REPO" --pr 1 --ref "$CHECKMATE_HEAD"
+          wc -c "$RUNNER_TEMP"/inventory/*.json
+
+      - name: Install the Claude CLI
+        run: |
+          npm install -g "@anthropic-ai/claude-code@${LINDAMAR_CLAUDE_CLI_VERSION}"
+          claude --version
+
+      - name: Pre-review
+        id: review
+        working-directory: target
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.ANTHROPIC_API_KEY == '' && secrets.CLAUDE_CODE_OAUTH_TOKEN || '' }}
+          MODEL: ${{ inputs.model }}
+          MAX_TURNS: ${{ inputs.max-turns }}
+        run: |
+          set -uo pipefail
+          skills="$(for f in "$RUNNER_TEMP"/skills/*/SKILL.md; do printf '%s ' "$f"; done)"
+          prompt="You are Lindamar review, run before a pull request exists, on a change Checkmate's agent made.
+
+          The change is the diff in $RUNNER_TEMP/change/proposed.diff, applied to this checkout. Review it by the rules in these skills: $skills
+          The review's own enumerators listed the candidates in $RUNNER_TEMP/inventory/ (candidates.json, dependencies.json, shell.json): rule on every candidate that is in this diff.
+
+          Write your findings, and nothing else, to .checkmate-prereview.json in this directory: a JSON array, each finding {\"rule\": \"<the skill's rule id>\", \"severity\": \"critical\" or \"nice-to-have\", \"file\": \"<path>\", \"line\": <number>, \"title\": \"<one line>\", \"fixPrompt\": \"<what to change, for the fixer>\"}. Critical means it blocks a merge under the skill's own criteria. An empty array means nothing blocks. You can read files; you cannot run commands or change the code."
+          rc=0
+          claude -p "$prompt" \
+            --model "$MODEL" \
+            --max-turns "$MAX_TURNS" \
+            --permission-mode acceptEdits \
+            --allowedTools "Read" "Glob" "Grep" "Write" \
+            --disallowedTools "Bash" "Edit" "WebFetch" "WebSearch" "NotebookEdit" \
+            --add-dir "$RUNNER_TEMP/skills" "$RUNNER_TEMP/change" "$RUNNER_TEMP/inventory" \
+            </dev/null > "$RUNNER_TEMP/review.jsonl" 2>"$RUNNER_TEMP/review.err" || rc=$?
+          tail -c 2000 "$RUNNER_TEMP/review.err" || true
+          cost="$(jq -rs '[.[] | select(.type == "result") | .total_cost_usd // 0] | add // 0' "$RUNNER_TEMP/review.jsonl" 2>/dev/null || echo 0)"
+          echo "cost=$cost" >> "$GITHUB_OUTPUT"
+          [ "$rc" -eq 0 ] || { echo "::error title=Pre-review did not finish::claude exited $rc"; exit 1; }
+          [ -f .checkmate-prereview.json ] || { echo "::error title=Pre-review wrote no findings::no .checkmate-prereview.json"; exit 1; }
+          mv .checkmate-prereview.json "$RUNNER_TEMP/prereview.json"
+
+      - name: Decide, by the review's own severity rules
+        id: verdict
+        env:
+          AGENT_COST: ${{ needs.agent.outputs.cost }}
+          REVIEW_COST: ${{ steps.review.outputs.cost }}
+          SPENT: ${{ inputs.spent }}
+          ROUND: ${{ inputs.round }}
+        run: |
+          set -euo pipefail
+          findings="$RUNNER_TEMP/prereview.json"
+          jq -e 'type == "array"' "$findings" >/dev/null || { echo "::error title=Pre-review findings are not a JSON array::"; exit 1; }
+          # post-review.sh's normalisation, verbatim in effect: a missing severity is
+          # critical, and critical|blocker|error|fatal|high all are; config/watcher.json's
+          # verdict.blockOnSeverity (default ["critical"]) is what blocks.
+          block="$(jq -r '(.verdict.blockOnSeverity // ["critical"]) | join("|")' "$RUNNER_TEMP/skills/.reviewer/config/watcher.json" 2>/dev/null || true)"
+          [ -n "$block" ] || block="critical"
+          jq --arg re "^($block)$" '[ .[] | . + { severity:
+                ( ((.severity // "critical") | ascii_downcase) as $s
+                  | if $s | test("^(critical|blocker|error|fatal|high)$") then "critical" else "nice-to-have" end) } ]
+              | [ .[] | select(.severity | test($re)) ]' "$findings" > "$RUNNER_TEMP/blocking.json"
+          n="$(jq length "$RUNNER_TEMP/blocking.json")"
+          # What goes back to the agent: rule, file, line, title, fixPrompt; at most 20 and 8 KB.
+          jq -c '[ .[:20][] | { rule, file, line, title: ((.title // "") | .[:200]), fixPrompt: ((.fixPrompt // "") | .[:600]) } ]' \
+            "$RUNNER_TEMP/blocking.json" > "$RUNNER_TEMP/feedback.json"
+          while [ "$(wc -c < "$RUNNER_TEMP/feedback.json")" -gt 8192 ]; do
+            jq -c '.[:-1]' "$RUNNER_TEMP/feedback.json" > "$RUNNER_TEMP/f.tmp" && mv "$RUNNER_TEMP/f.tmp" "$RUNNER_TEMP/feedback.json"
+          done
+          cost="$(awk -v a="${AGENT_COST:-0}" -v b="${REVIEW_COST:-0}" 'BEGIN { printf "%.4f", a + b }')"
+          spent="$(awk -v s="${SPENT:-0}" -v c="$cost" 'BEGIN { printf "%.4f", s + c }')"
+          verdict=clean; [ "$n" -eq 0 ] || verdict=critical
+          {
+            echo "verdict=$verdict"; echo "cost=$cost"; echo "spent=$spent"
+            echo "findings=$(cat "$RUNNER_TEMP/feedback.json")"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "### Pass $ROUND pre-review: $verdict ($n merge-blocking)"
+            echo "Cost: \$$cost (agent \$${AGENT_COST:-0}, pre-review \$${REVIEW_COST:-0}); spent so far \$$spent."
+            jq -r '.[] | "- `\(.rule)` \(.file):\(.line) \(.title)"' "$RUNNER_TEMP/feedback.json"
+          } >> "$GITHUB_STEP_SUMMARY"
