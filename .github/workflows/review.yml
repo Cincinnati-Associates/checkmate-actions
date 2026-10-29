@@ -840,11 +840,18 @@ jobs:
           # that path a "started" notice would just double the channel's volume.
           [ -n "${BOT:-}" ] && [ -n "${CH:-}" ] || exit 0
           txt=":mag: *<$URL|$REPO #$PR>* — reviewing…"$'\n'"$(printf '%.90s' "$TITLE")"
-          ts=$(curl -sS -m 15 -X POST -H "Authorization: Bearer $BOT" \
+          # A notice is never worth a review: whatever Slack says, this step
+          # succeeds, and a refusal is named as a warning.
+          r=$(curl -sS -m 15 -X POST -H "Authorization: Bearer $BOT" \
             -H 'Content-type: application/json' \
             -d "$(jq -n --arg c "$CH" --arg t "$txt" '{channel:$c, text:$t}')" \
-            https://slack.com/api/chat.postMessage | jq -r '.ts // empty')
-          [ -n "$ts" ] && echo "ts=$ts" >> "$GITHUB_OUTPUT" && echo "posted $ts"
+            https://slack.com/api/chat.postMessage || true)
+          ts=$(printf '%s' "$r" | jq -r '.ts // empty' 2>/dev/null || true)
+          if [ -n "$ts" ]; then
+            echo "ts=$ts" >> "$GITHUB_OUTPUT"; echo "posted $ts"
+          else
+            echo "::warning title=Slack not notified::$(printf '%s' "$r" | jq -r '.error // "no answer"' 2>/dev/null || echo "no answer"). The review is unaffected."
+          fi
 
       - name: Review
         if: steps.already.outputs.skip != 'true' && steps.triage.outputs.skip == ''
