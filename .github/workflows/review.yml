@@ -295,8 +295,11 @@ jobs:
           # read as `claude-credential: CREDENTIAL` and its tenant URL lines as
           # `checkmate-url: CHECKMATE_URL`, and of the retry template as is.
           # scripts/test-review-triage.sh fails when either template changes
-          # and these do not.
-          INSTALL_TEMPLATE_SHA256: 564cb789d1b6b9e377ec5cb5872fe945fb0e11c50a43a1554aeaa09ff12e128f
+          # and these do not. PREVIOUS_ is the caller before its descriptions
+          # lost their quotes, so an install pull request opened from it is
+          # still skipped.
+          INSTALL_TEMPLATE_SHA256: fb0b812fe6ebab5a742b98faea5a00812fc5e5af5ed33f712d81375e6f9e3333
+          PREVIOUS_INSTALL_TEMPLATE_SHA256: 564cb789d1b6b9e377ec5cb5872fe945fb0e11c50a43a1554aeaa09ff12e128f
           RETRY_TEMPLATE_SHA256: 8311757a1233a18701d746f5765daf705d3614f27dba4bda67b06db939a61dc9
         run: |
           set -uo pipefail
@@ -340,7 +343,7 @@ jobs:
           # checkmate-url lines free to name the tenant's https host. Any
           # other edit to this workflow is the edit that most needs a review,
           # and gets one.
-          install_file_ok() {  # install_file_ok <path> <want-sha256> <normalise:0|1>
+          install_file_ok() {  # install_file_ok <path> "<want-sha256>..." <normalise:0|1>
             local got
             got="$(gh api -H "Accept: application/vnd.github.raw" "repos/$REPO/contents/$1?ref=$SHA" 2>/dev/null \
                     | if [ "$3" = 1 ]; then
@@ -348,7 +351,7 @@ jobs:
                                -e 's#^      checkmate-url: https://[A-Za-z0-9.-]+$#      checkmate-url: CHECKMATE_URL#'
                       else cat; fi \
                     | openssl dgst -sha256 -r | cut -d' ' -f1 || true)"
-            [ -n "$got" ] && [ "$got" = "$2" ]
+            [ -n "$got" ] && case " $2 " in *" $got "*) true ;; *) false ;; esac
           }
           if [ "$HEAD_REF" = "lindamar/pipeline-v1" ] && [ "$HEAD_REPO" = "$REPO" ] \
              && [ "$AUTHOR" = "lindamar-reviewer[bot]" ] && [ "$AUTHOR_TYPE" = "Bot" ]; then
@@ -356,7 +359,7 @@ jobs:
             while IFS= read -r p; do
               case "$p" in
                 .github/workflows/lindamar-review.yml)
-                  caller=1; install_file_ok "$p" "$INSTALL_TEMPLATE_SHA256" 1 || verdict="$p is not the template" ;;
+                  caller=1; install_file_ok "$p" "$INSTALL_TEMPLATE_SHA256 $PREVIOUS_INSTALL_TEMPLATE_SHA256" 1 || verdict="$p is not the template" ;;
                 .github/workflows/lindamar-review-retry.yml)
                   install_file_ok "$p" "$RETRY_TEMPLATE_SHA256" 0 || verdict="$p is not the template" ;;
                 *) verdict="it also changes $p" ;;
