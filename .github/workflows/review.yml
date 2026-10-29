@@ -831,6 +831,7 @@ jobs:
         env:
           BOT: ${{ secrets.LINDAMAR_SLACK_BOT_TOKEN }}
           CH: ${{ secrets.LINDAMAR_SLACK_CHANNEL }}
+          HOOK: ${{ secrets.LINDAMAR_SLACK_WEBHOOK }}
           REPO: ${{ github.repository }}
           PR: ${{ steps.pr.outputs.number }}
           TITLE: ${{ steps.pr.outputs.title }}
@@ -850,7 +851,13 @@ jobs:
           if [ -n "$ts" ]; then
             echo "ts=$ts" >> "$GITHUB_OUTPUT"; echo "posted $ts"
           else
-            echo "::warning title=Slack not notified::$(printf '%s' "$r" | jq -r '.error // "no answer"' 2>/dev/null || echo "no answer"). The review is unaffected."
+            why=$(printf '%s' "$r" | jq -r '.error // "no answer"' 2>/dev/null || true)
+            why="${why:-no answer}"
+            # No "reviewing…" through the webhook: its message could not be
+            # edited into the result. The result step tries it instead.
+            then_what="The review is unaffected."
+            [ -z "${HOOK:-}" ] || then_what="The result will go through LINDAMAR_SLACK_WEBHOOK; the review is unaffected."
+            echo "::warning title=Slack not notified::$why. $then_what"
           fi
 
       - name: Review
@@ -1686,6 +1693,7 @@ jobs:
           line2="$(printf '%.90s' "$TITLE")  ·  by $AUTHOR  ·  $cost"
           txt="$line1"$'\n'"$line2"
 
+          sent=""; why=""
           if [ -n "${BOT:-}" ] && [ -n "${CH:-}" ]; then
             # Edit the "reviewing…" message into the result rather than adding a
             # second one. Only a bot token can do this; a webhook's messages are
@@ -1694,20 +1702,37 @@ jobs:
               r=$(curl -sS -m 15 -X POST -H "Authorization: Bearer $BOT" \
                 -H 'Content-type: application/json' \
                 -d "$(jq -n --arg c "$CH" --arg t "$START_TS" --arg x "$txt" '{channel:$c, ts:$t, text:$x}')" \
-                https://slack.com/api/chat.update)
+                https://slack.com/api/chat.update || true)
             else
               r=$(curl -sS -m 15 -X POST -H "Authorization: Bearer $BOT" \
                 -H 'Content-type: application/json' \
                 -d "$(jq -n --arg c "$CH" --arg x "$txt" '{channel:$c, text:$x}')" \
-                https://slack.com/api/chat.postMessage)
+                https://slack.com/api/chat.postMessage || true)
             fi
-            printf '%s' "$r" | jq -e '.ok' >/dev/null 2>&1 \
-              && echo "notified via bot token" \
-              || echo "::warning title=Slack not notified::$(printf '%s' "$r" | jq -r '.error // "?"'). The review is unaffected."
-          elif [ -n "${HOOK:-}" ]; then
-            curl -sS -m 15 -X POST -H 'Content-type: application/json' \
-              --data "$(jq -n --arg t "$txt" '{text:$t}')" "$HOOK" >/dev/null 2>&1 \
-              && echo "notified via webhook" || echo "::warning title=Slack not notified::The review is unaffected."
+            if printf '%s' "$r" | jq -e '.ok == true' >/dev/null 2>&1; then
+              sent="bot token"
+            else
+              why=$(printf '%s' "$r" | jq -r '.error // "no answer"' 2>/dev/null || true)
+              why="${why:-no answer}"
+            fi
+          fi
+          # The webhook: the only way, or the fallback when the bot could not
+          # post. It is a secret: from env, quoted, never echoed.
+          if [ -z "$sent" ] && [ -n "${HOOK:-}" ]; then
+            if [ -n "$why" ]; then
+              echo "::warning title=Slack bot could not post::$why. Posting the result through LINDAMAR_SLACK_WEBHOOK instead."
+            fi
+            if curl -sSf -m 15 -X POST -H 'Content-type: application/json' \
+              --data "$(jq -n --arg t "$txt" '{text:$t}')" "$HOOK" >/dev/null 2>&1; then
+              sent="webhook"
+            else
+              why="${why:+$why; }the webhook refused it"
+            fi
+          fi
+          if [ -n "$sent" ]; then
+            echo "notified via $sent"
+          elif [ -n "$why" ]; then
+            echo "::warning title=Slack not notified::$why. The review is unaffected."
           fi
 
   # Separate job, for one reason: it needs `statuses: write` and the review job
