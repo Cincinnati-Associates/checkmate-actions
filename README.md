@@ -18,11 +18,11 @@ on:
   workflow_dispatch:
     inputs:
       pr:
-        description: "Pull request number to review"
+        description: Pull request number to review
         required: false
         type: string
       agent_fix:
-        description: "Set by the Checkmate console only: the suggestion an agent fixes, as JSON"
+        description: Set by the Checkmate console only, the suggestion an agent fixes as JSON
         required: false
         type: string
 
