@@ -292,10 +292,11 @@ jobs:
           CHANGED: ${{ steps.pr.outputs.changed }}
           MAX_AUTO_ROUNDS: ${{ inputs.max-auto-rounds }}
           # sha256 of docs/install/lindamar-review.yml with its credential line
-          # read as `claude-credential: CREDENTIAL`, and of the retry template
-          # as is. scripts/test-review-triage.sh fails when either template
-          # changes and these do not.
-          INSTALL_TEMPLATE_SHA256: 1f0e0e068f420858bd380a12a3a4b59db36ed22f102739036a74827691696579
+          # read as `claude-credential: CREDENTIAL` and its tenant URL lines as
+          # `checkmate-url: CHECKMATE_URL`, and of the retry template as is.
+          # scripts/test-review-triage.sh fails when either template changes
+          # and these do not.
+          INSTALL_TEMPLATE_SHA256: 564cb789d1b6b9e377ec5cb5872fe945fb0e11c50a43a1554aeaa09ff12e128f
           RETRY_TEMPLATE_SHA256: 8311757a1233a18701d746f5765daf705d3614f27dba4bda67b06db939a61dc9
         run: |
           set -uo pipefail
@@ -335,13 +336,16 @@ jobs:
           # adding or updating the caller and nothing else. Reviewing it spends a
           # review on a file whose every byte is ours. So it passes when the file
           # at the head commit IS the template, byte for byte, with only the
-          # credential line free to say api-key or subscription. Any other edit
-          # to this workflow is the edit that most needs a review, and gets one.
+          # credential line free to say api-key or subscription and the
+          # checkmate-url lines free to name the tenant's https host. Any
+          # other edit to this workflow is the edit that most needs a review,
+          # and gets one.
           install_file_ok() {  # install_file_ok <path> <want-sha256> <normalise:0|1>
             local got
             got="$(gh api -H "Accept: application/vnd.github.raw" "repos/$REPO/contents/$1?ref=$SHA" 2>/dev/null \
                     | if [ "$3" = 1 ]; then
-                        sed -E 's/^      claude-credential: (api-key|subscription)$/      claude-credential: CREDENTIAL/'
+                        sed -E -e 's/^      claude-credential: (api-key|subscription)$/      claude-credential: CREDENTIAL/' \
+                               -e 's#^      checkmate-url: https://[A-Za-z0-9.-]+$#      checkmate-url: CHECKMATE_URL#'
                       else cat; fi \
                     | openssl dgst -sha256 -r | cut -d' ' -f1 || true)"
             [ -n "$got" ] && [ "$got" = "$2" ]

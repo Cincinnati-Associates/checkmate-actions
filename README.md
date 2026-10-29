@@ -18,13 +18,19 @@ on:
   workflow_dispatch:
     inputs:
       pr:
+        description: "Pull request number to review"
         required: false
         type: string
       agent_fix:
+        description: "Set by the Checkmate console only: the suggestion an agent fixes, as JSON"
         required: false
         type: string
 
 permissions: {}
+
+concurrency:
+  group: lindamar-review-caller-${{ github.event.pull_request.number || github.event.inputs.pr || github.run_id }}-${{ github.event_name }}
+  cancel-in-progress: true
 
 jobs:
   review:
@@ -37,10 +43,6 @@ jobs:
       statuses: write      # hand-started runs only
       checks: write        # hand-started runs only
     uses: Cincinnati-Associates/checkmate-actions/.github/workflows/review.yml@v1
-    with:
-      checkmate-url: https://<your-tenant>.example.com   # your Checkmate console URL, no trailing slash
-      claude-credential: api-key
-      pr: ${{ github.event.inputs.pr }}
     secrets:
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
       CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
@@ -49,19 +51,23 @@ jobs:
       LINDAMAR_SLACK_WEBHOOK: ${{ secrets.LINDAMAR_SLACK_WEBHOOK }}
       LINDAMAR_APPROVER_PAT: ${{ secrets.LINDAMAR_APPROVER_PAT }}
       LINDAMAR_FINDINGS_KEY: ${{ secrets.LINDAMAR_FINDINGS_KEY }}
-
+    with:
+      # Your Checkmate console URL: https and a bare host, no trailing slash.
+      checkmate-url: https://checkmate.example.com
+      claude-credential: api-key
+      pr: ${{ github.event.inputs.pr }}
   agent-fix:
     if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.agent_fix != '' }}
     permissions:
       id-token: write
       contents: read
     uses: Cincinnati-Associates/checkmate-actions/.github/workflows/agent-fix.yml@v1
-    with:
-      checkmate-url: https://<your-tenant>.example.com
-      task: ${{ github.event.inputs.agent_fix }}
     secrets:
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
       CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+    with:
+      checkmate-url: https://checkmate.example.com
+      task: ${{ github.event.inputs.agent_fix }}
 ```
 
 `id-token: write` must be granted by the calling job. A reusable workflow cannot raise its caller's permissions. Without it, the token step fails with an error that says so.
