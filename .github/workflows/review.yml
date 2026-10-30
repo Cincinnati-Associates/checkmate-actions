@@ -123,7 +123,7 @@ on:
         description: "Root of the key that signs each review's findings block. Only the post job reads it, and only through HKDF. Without it nothing is signed, so nothing is carried between rounds and every push is a full review. Any long random string; generate with `openssl rand -hex 32`."
         required: false
       LINDAMAR_APPROVER_PAT:
-        description: "A generic account's fine-grained PAT, used ONLY to approve when nothing blocks. GitHub accepts an approval from a user identity and from nothing else — not a GitHub App, not GITHUB_TOKEN, not a ruleset bypass; all three were tested. Omit it to leave approving to a person."
+        description: "A generic account's fine-grained PAT, used ONLY to approve when nothing blocks and to resolve the reviewer's own threads for findings a later round closed. GitHub accepts an approval from a user identity and from nothing else — not a GitHub App, not GITHUB_TOKEN, not a ruleset bypass; all three were tested. Omit it to leave approving, and resolving those threads, to a person."
         required: false
 
 # A push mid-review makes the findings describe a commit that no longer exists,
@@ -1216,6 +1216,10 @@ jobs:
           # it, every open critical outside it carried).
           LINDAMAR_SCOPE: ${{ needs.agent.outputs.scope }}
           LINDAMAR_SCOPE_FROM: ${{ needs.agent.outputs.scope_from }}
+          # Resolves the threads of findings this review closed, and nothing
+          # else: post-review.sh uses it for resolveReviewThread only. Not
+          # GITHUB_TOKEN, which is reported to need contents: write for it.
+          LINDAMAR_RESOLVE_TOKEN: ${{ secrets.LINDAMAR_APPROVER_PAT }}
         run: |
           set -uo pipefail
           bad() { echo "::error title=The agent's review did not validate::$1. Nothing was posted."; exit 1; }
