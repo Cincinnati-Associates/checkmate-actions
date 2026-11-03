@@ -804,28 +804,22 @@ jobs:
           # installed set against the lock plus config/authored-skills.json and
           # exits non-zero, so a review never runs backed by fewer rule
           # catalogues than it names.
-          npm install --no-audit --no-fund
-          # install-skills.sh distinguishes its two failures on purpose: 1 means a
-          # community skill did not come over the network, 2 means an authored
-          # skill is missing from the tree. Running it bare treated both the same
-          # — the distinction was built and then not used, which the reviewer
-          # caught on its own source. A transient fetch is worth one retry; a
-          # broken tree is not.
+          #
+          # No network and no retry. The community skills are vendored in the
+          # reviewer checkout and checked against their computedHash in
+          # skills-lock.json; they used to come from an unpinned `npx skills`,
+          # and on 2026-11-02 its 1.7.5 began refusing in CI the three whose
+          # upstream had moved past the lock — 12 of 18 runs in one repository
+          # failed here that day, and the retry failed the same way every time. Every
+          # skill now lives in the checkout, so a non-zero exit means the tree
+          # is wrong, and waiting does not change that.
           set +e
           sh scripts/install-skills.sh; rc=$?
-          if [ "$rc" -eq 1 ]; then
-            echo "::warning title=Retrying community skills::A community skill did not restore; retrying once before failing."
-            sleep 10
-            sh scripts/install-skills.sh; rc=$?
-          fi
           set -e
-          if [ "$rc" -eq 2 ]; then
-            echo "::error title=Reviewer tree is incomplete::An authored skill is missing from the reviewer checkout, so a review would run backed by fewer rule catalogues than it names. This is not a network problem."
-            exit 2
+          if [ "$rc" -ne 0 ]; then
+            echo "::error title=Reviewer skills incomplete::A skill in the reviewer checkout is missing or does not match its pin (see the count above), so a review would run backed by fewer rule catalogues than it names. This is not a network problem."
+            exit "$rc"
           fi
-          [ "$rc" -eq 0 ] || { echo "::error title=Skills incomplete after retry::See the count above."; exit "$rc"; }
-        env:
-          npm_config_yes: "true"
 
       - name: Install the Claude CLI
         id: cli
