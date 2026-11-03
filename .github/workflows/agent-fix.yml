@@ -206,13 +206,13 @@ jobs:
         working-directory: .lindamar-reviewer
         env:
           SKILLS: ${{ steps.which.outputs.skills }}
-          npm_config_yes: "true"
         run: |
           set -euo pipefail
           # The same installer the review runs, which checks the installed set
           # against its lock and the authored list and exits non-zero on a gap.
-          npm install --no-audit --no-fund --ignore-scripts
-          sh scripts/install-skills.sh || { sleep 10; sh scripts/install-skills.sh; }
+          # Offline: the community skills are vendored and hash-checked, so
+          # there is nothing a retry could fetch.
+          sh scripts/install-skills.sh
           mkdir -p "$RUNNER_TEMP/skills"
           for s in $SKILLS; do
             [ -f ".claude/skills/$s/SKILL.md" ] || { echo "::error title=Review skill missing::$s is not installed, so the agent would not be held to it."; exit 1; }
