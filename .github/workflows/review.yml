@@ -192,6 +192,7 @@ jobs:
       ran: ${{ steps.review.outputs.ran }}
       blocked: ${{ steps.review.outputs.blocked }}
       reset_at: ${{ steps.review.outputs.resetAt }}
+      limit: ${{ steps.review.outputs.limit }}
       slack_ts: ${{ steps.slackstart.outputs.ts }}
       cost: ${{ steps.cost.outputs.cost }}
     timeout-minutes: ${{ inputs.timeout-minutes }}
@@ -924,6 +925,17 @@ jobs:
                    + (if (.result // "") != "" then "\n" + ((.result|tostring)[0:1500]) else "" end)' \
             "$RUNNER_TEMP/stream.jsonl" 2>/dev/null | tail -c 2000 || true
           echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          # A run that exited 0 and handed nothing over reviewed nothing the post
+          # job can use. It is classified like a failed exit, because a limit
+          # can end a run without a review whatever the exit code was; a run
+          # that did hand a review over is never classified, so a verdict can
+          # never be read as a limit.
+          nohandoff=""
+          if [ "$rc" -eq 0 ]; then
+            for f in findings.json summary.md meta.json; do
+              [ -s "$LINDAMAR_HANDOFF_DIR/$f" ] || { nohandoff="$f"; rc=1; break; }
+            done
+          fi
           if [ "$rc" -ne 0 ]; then
             # Say WHY it could not review. "The reviewer found problems" and "the
             # reviewer never ran" had the same red check and the same wording,
@@ -946,35 +958,77 @@ jobs:
             # step — taking the notice with it, in precisely the case the notice
             # exists to report. sh-205 for the third time in this branch, which is
             # why check-workflows.sh now looks for the shape.
-            txt="$( { cat "$RUNNER_TEMP/stream.err" 2>/dev/null; \
-                      jq -r 'select(.type=="result") | select(.is_error == true) | ((.result // "") | tostring)' \
-                        "$RUNNER_TEMP/stream.jsonl" 2>/dev/null; } | tr 'A-Z' 'a-z' || true )"
-            blocked=""
+            # The assistant messages the CLI itself flags with an `error` field
+            # count too: that is where print mode puts "You've hit your 5-hour
+            # limit · resets 3pm (UTC)". The model's own prose has no such field.
+            raw="$( { cat "$RUNNER_TEMP/stream.err" 2>/dev/null; \
+                      jq -r 'if .type == "result" then (select(.is_error == true) | (.result // "") | tostring)
+                             elif .type == "assistant" and ((.error // "") != "") then
+                               "error=\(.error) " + ([.message.content[]? | select(.type == "text") | .text] | join(" "))
+                             else empty end' \
+                        "$RUNNER_TEMP/stream.jsonl" 2>/dev/null; } || true )"
+            txt="$(printf '%s' "$raw" | tr 'A-Z' 'a-z' || true)"
+            # The CLI's own record of a refusal: a rate_limit_event whose status
+            # is "rejected" names the window and its reset as an epoch.
+            rl="$(jq -s -r '[.[] | select(.type == "rate_limit_event") | (.rate_limit_info // {}) | select(.status == "rejected")]
+                            | last // {} | "\(.rateLimitType // "-") \(.resetsAt // "-")"' \
+                    "$RUNNER_TEMP/stream.jsonl" 2>/dev/null || true)"
+            read -r rltype rlreset <<< "${rl:-- -}" || true
+            blocked=""; limit=""
+            # Most specific first: "not your usage limit" is the server's own
+            # throttle, and "Opus limit" is a weekly limit that is not the
+            # all-models one.
             case "$txt" in
-              *"usage limit"*|*usage_limit*|*"rate limit"*|*rate_limit*|*"spend limit"*|*"out of credit"*|*"credit balance"*|*quota*) blocked=usage ;;
+              *"not your usage limit"*) limit=server ;;
+              *"5-hour limit"*|*"session limit"*) limit=session ;;
+              *"opus limit"*|*"sonnet limit"*|*"fable limit"*) limit=model ;;
+              *"weekly limit"*) limit=weekly ;;
+              *"credit balance"*|*"out of usage credits"*|*"out of extra usage"*|*"usage credit limit"*|*"out of credit"*|*"spend limit"*|*error=billing_error*) limit=credit ;;
+              *rate_limit_error*|*error=rate_limit*|*"rate limit"*|*rate_limit*) limit=api-rate ;;
+              *"usage limit"*|*usage_limit*|*quota*) limit=unknown ;;
               *authentication*|*unauthorized*|*"invalid api key"*|*"invalid token"*|*oauth*) blocked=auth ;;
             esac
+            case "$rltype" in
+              five_hour) limit=session ;;
+              seven_day) limit=weekly ;;
+              seven_day_opus|seven_day_sonnet|seven_day_overage_included) limit=model ;;
+              overage) limit=credit ;;
+            esac
+            if [ -n "$limit" ]; then blocked=usage; fi
             if [ -z "$blocked" ] && [ "${turns:-0}" -le 1 ] && [ "${outtok:-0}" -eq 0 ]; then blocked=nowork; fi
+            # A run that exited 0 without a review gets a notice only for a
+            # cause somebody can act on, as before.
+            if [ -n "$nohandoff" ] && [ "$blocked" != usage ] && [ "$blocked" != auth ]; then blocked=""; fi
             echo "blocked=$blocked" >> "$GITHUB_OUTPUT"
-            # A reset time only if the CLI named one. Do not invent one.
-            reset="$(printf '%s' "$txt" | sed -nE 's/.*reset[^0-9]{0,24}([0-9]{1,2}:[0-9]{2}( ?[ap]m)?).*/\1/p' | head -1)"
+            # A reset time only if the CLI named one. Do not invent one. The
+            # event's epoch first, then the CLI's words ("resets 3pm (UTC)",
+            # "resets Nov 5, 9am (UTC)"), then the old "limit reached|<epoch>".
+            reset=""
+            if [ "$blocked" = usage ]; then
+              echo "limit=$limit" >> "$GITHUB_OUTPUT"
+              case "$rlreset" in ''|*[!0-9]*) ;; *) reset="$(jq -rn --argjson t "$rlreset" '$t | strftime("%Y-%m-%d %H:%M UTC")' 2>/dev/null || true)" ;; esac
+              re_words='[Rr]esets (at )?([A-Za-z0-9:,/()_+. -]{1,48})'
+              re_epoch='limit reached\|([0-9]{9,11})'
+              if [ -z "$reset" ] && [[ "$raw" =~ $re_words ]]; then
+                reset="${BASH_REMATCH[2]}"; reset="${reset%%. *}"; reset="${reset%"${reset##*[!. ]}"}"
+              elif [ -z "$reset" ] && [[ "$raw" =~ $re_epoch ]]; then
+                reset="$(jq -rn --argjson t "${BASH_REMATCH[1]}" '$t | strftime("%Y-%m-%d %H:%M UTC")' 2>/dev/null || true)"
+              fi
+              printf '%s' "$reset" | grep -Eq '^[A-Za-z0-9:,/()_+. -]{1,48}$' || reset=""
+            fi
             [ -n "$reset" ] && echo "resetAt=$reset" >> "$GITHUB_OUTPUT"
             case "$blocked" in
-              usage) echo "::error title=Out of usage, nothing was reviewed::The reviewer's credential has no usage left, so this pull request was not checked. This is not a finding and nothing here is the author's to fix. It retries by itself." ;;
+              usage) echo "::error title=Claude usage limit reached ($limit), nothing was reviewed::The reviewer's Claude credential is out of usage${reset:+ until $reset}, so this pull request was not checked. This is not a finding and nothing here is the author's to fix. The required check says what to do." ;;
               auth)  echo "::error title=Credential rejected, nothing was reviewed::The reviewer's credential was refused. This pull request was not checked, and retrying will not help until the secret is replaced." ;;
               nowork) echo "::error title=The reviewer did no work::It started, used no tokens and stopped on the first turn, so it never got as far as reading the diff. Its stderr and result event are above." ;;
-              *) echo "::error title=The reviewer exited $rc::The CLI ran and failed. Its stderr and result event are above. Nothing was posted, so the gate is red for that reason and not for a finding." ;;
+              *) if [ -n "$nohandoff" ]; then
+                   echo "::error title=The agent handed nothing over::It exited 0 without writing $nohandoff to the handoff directory, so there is no review to post."
+                 else
+                   echo "::error title=The reviewer exited $rc::The CLI ran and failed. Its stderr and result event are above. Nothing was posted, so the gate is red for that reason and not for a finding."
+                 fi ;;
             esac
             exit "$rc"
           fi
-          # A run that exited 0 and handed nothing over reviewed nothing the post
-          # job can use. Saying so here keeps it from reading as a pass later.
-          for f in findings.json summary.md meta.json; do
-            if [ ! -s "$LINDAMAR_HANDOFF_DIR/$f" ]; then
-              echo "::error title=The agent handed nothing over::It exited 0 without writing $f to the handoff directory, so there is no review to post."
-              exit 1
-            fi
-          done
           echo "ran=true" >> "$GITHUB_OUTPUT"
 
       # The review, as data, for the post job. Retention is a day: it quotes
@@ -1320,6 +1374,9 @@ jobs:
           SIG: ${{ github.workspace }}/.lindamar-reviewer/scripts/lib/findings_sig.py
           JOB_STATUS: ${{ job.status }}
           AGENT_RESULT: ${{ needs.agent.result }}
+          BLOCKED: ${{ needs.agent.outputs.blocked }}
+          LIMIT: ${{ needs.agent.outputs.limit }}
+          RESET_AT: ${{ needs.agent.outputs.reset_at }}
         run: |
           # Read the verdict from GitHub, not from the transcript. A run can print
           # a confident summary and never have posted anything — that happened
@@ -1340,6 +1397,28 @@ jobs:
             msg="The automatic review budget for this pull request is used up ($n rounds). Fix all the findings in one push, then start a review of that commit by hand: Actions → Lindamar review → Run workflow with PR number ${PR:-?}, or from the console. It is never capped and counts as a round. To have a blocked commit ruled on again without a push (a finding fixed in another file, say), a person must start it from Actions: the console and the retry are bots, and a bot's run stops at any verdict already on the commit."
             echo "::error title=Automatic review budget used up::$msg"
             { echo "### automatic review budget used up"; echo ""; echo "$msg"; } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          # The Claude credential hit a limit, so the review never ran. Said
+          # here, on the required check, because the agent job's annotation is
+          # not what the author sees. Red, always: an unreviewed commit is not a
+          # passing one. Only when no review ran, so a verdict is never read as
+          # a limit. Both values are checked, not trusted.
+          if [ "${BLOCKED:-}" = usage ] && [ "${REVIEW_RAN:-}" != "true" ]; then
+            printf '%s' "${RESET_AT:-}" | grep -Eq '^[A-Za-z0-9:,/()_+. -]{1,48}$' || RESET_AT=""
+            case "${LIMIT:-}" in
+              session)  title="Claude 5-hour limit reached";      what="its Claude subscription's 5-hour session limit" ;;
+              weekly)   title="Claude weekly limit reached";      what="its Claude subscription's weekly limit" ;;
+              model)    title="Claude weekly model limit reached"; what="its Claude subscription's weekly limit for the model it runs" ;;
+              credit)   title="Claude credit balance too low";    what="the end of its API credit balance or usage credits" ;;
+              api-rate) title="Claude API rate limit reached";    what="the Anthropic API rate limit" ;;
+              server)   title="Claude API is limiting requests";  what="a server-side limit on Anthropic's end (not the credential's own usage)" ;;
+              *)        title="Claude usage limit reached";       what="a Claude usage limit the CLI did not name" ;;
+            esac
+            msg="The review did not run: the reviewer's Claude credential hit $what${RESET_AT:+, which resets $RESET_AT}. This red check is not a verdict on the code, and nothing here is the author's to fix. Wait${RESET_AT:+ until it resets} and re-run this job (the automatic retry also tries again), or switch the reviewer to another Claude credential in the Checkmate console."
+            echo "::error title=$title, nothing was reviewed::$msg"
+            { echo "### $title, nothing was reviewed"; echo ""; echo "$msg"; } >> "$GITHUB_STEP_SUMMARY"
+            { echo "limit_title=$title"; echo "limit_msg=$msg"; } >> "$GITHUB_OUTPUT"
             exit 1
           fi
           # Triage decided no review was needed. Green, with the reason on the
@@ -1515,6 +1594,7 @@ jobs:
           PR: ${{ needs.agent.outputs.number }}
           BLOCKED: ${{ needs.agent.outputs.blocked }}
           RESET_AT: ${{ needs.agent.outputs.reset_at }}
+          LIMIT_MSG: ${{ steps.gate.outputs.limit_msg }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -uo pipefail
@@ -1522,7 +1602,7 @@ jobs:
           # values are checked here rather than trusted, since they end up in a
           # comment posted as the reviewer.
           case "${BLOCKED:-}" in usage|auth|nowork) ;; *) BLOCKED=other ;; esac
-          printf '%s' "${RESET_AT:-}" | grep -Eq '^[0-9]{1,2}:[0-9]{2}( ?[ap]m)?$' || RESET_AT=""
+          printf '%s' "${RESET_AT:-}" | grep -Eq '^[A-Za-z0-9:,/()_+. -]{1,48}$' || RESET_AT=""
           # The reason goes in the marker. One marker for every reason meant
           # the retry could not tell a usage block — which clears itself — from
           # an auth block, which never does until somebody rotates a secret. The
@@ -1530,8 +1610,11 @@ jobs:
           MARK="<!-- lindamar-review:blocked:${BLOCKED:-other} -->"
           case "$BLOCKED" in
             usage)
-              headline="**The reviewer has no usage left, so this pull request was not checked.**"
-              detail="Nothing here is yours to fix. It retries on its own${RESET_AT:+, and the credential resets around \`$RESET_AT\`}. The check stays red until a review actually runs, because an unreviewed commit is not a passing one." ;;
+              headline="**The reviewer hit a Claude usage limit, so this pull request was not checked.**"
+              # The gate's sentence, composed from the checked values: which
+              # limit, when it resets, and what to do.
+              detail="Nothing here is yours to fix. It retries on its own${RESET_AT:+, and the credential resets around \`$RESET_AT\`}. The check stays red until a review actually runs, because an unreviewed commit is not a passing one."
+              [ -z "${LIMIT_MSG:-}" ] || detail="$LIMIT_MSG" ;;
             auth)
               headline="**The credential was refused, so this pull request was not checked.**"
               detail="Retrying will not help until the secret is replaced. Nothing here is yours to fix." ;;
@@ -1685,12 +1768,13 @@ jobs:
           GATE: ${{ steps.gate.outcome }}
           REVIEW_RAN: ${{ needs.agent.outputs.ran }}
           COST: ${{ needs.agent.outputs.cost }}
+          LIMIT_TITLE: ${{ steps.gate.outputs.limit_title }}
         run: |
           # Best-effort throughout: a notification failing must never fail a
           # review that already happened.
           cost="${COST:-not recorded}"
           if [ "$REVIEW_RAN" != "true" ]; then
-            emoji=":warning:"; verdict="did not run — nothing was checked"
+            emoji=":warning:"; verdict="did not run — ${LIMIT_TITLE:+$LIMIT_TITLE, }nothing was checked"
           elif [ "$GATE" = "success" ]; then
             emoji=":white_check_mark:"; verdict="nothing blocking"
           else
