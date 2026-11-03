@@ -843,6 +843,10 @@ jobs:
           # Only with a bot token. A webhook cannot edit what it posted, so on
           # that path a "started" notice would just double the channel's volume.
           [ -n "${BOT:-}" ] && [ -n "${CH:-}" ] || exit 0
+          # No pull request, no notice: the step runs on always(), so a run
+          # whose first step failed posted "<|owner/repo #> — reviewing…",
+          # linked to nothing, and nothing ever edited it.
+          [ -n "${PR:-}" ] || { echo "no pull request number; no start notice"; exit 0; }
           txt=":mag: *<$URL|$REPO #$PR>* — reviewing…"$'\n'"$(printf '%.90s' "$TITLE")"
           # A notice is never worth a review: whatever Slack says, this step
           # succeeds, and a refusal is named as a warning.
@@ -986,6 +990,31 @@ jobs:
           path: ${{ runner.temp }}/handoff
           retention-days: 1
           if-no-files-found: error
+
+      # A run a newer push cancelled left its ":mag: reviewing…" for good: the
+      # step that edits it runs only on !cancelled(). This one runs only on
+      # cancelled(), here and again in the review job, for a cancel in either.
+      - name: Mark the start notice superseded
+        if: cancelled() && steps.slackstart.outputs.ts != ''
+        continue-on-error: true
+        env:
+          BOT: ${{ secrets.LINDAMAR_SLACK_BOT_TOKEN }}
+          CH: ${{ secrets.LINDAMAR_SLACK_CHANNEL }}
+          START_TS: ${{ steps.slackstart.outputs.ts }}
+          REPO: ${{ github.repository }}
+          PR: ${{ steps.pr.outputs.number }}
+          URL: ${{ steps.pr.outputs.url }}
+        run: |
+          # Best-effort, and never a failure: a cancelled run's notice is
+          # cosmetic. A webhook cannot edit, and no start message means
+          # nothing to edit. The token is sent as a header and never echoed.
+          [ -n "${BOT:-}" ] && [ -n "${CH:-}" ] && [ -n "${START_TS:-}" ] || exit 0
+          txt=":fast_forward: *<$URL|$REPO #$PR>* — superseded by a newer push"
+          curl -sS -m 15 -X POST -H "Authorization: Bearer $BOT" \
+            -H 'Content-type: application/json' \
+            -d "$(jq -n --arg c "$CH" --arg t "$START_TS" --arg x "$txt" '{channel:$c, ts:$t, text:$x}' || true)" \
+            https://slack.com/api/chat.update >/dev/null 2>&1 || true
+          echo "marked the start notice superseded"
 
       - name: Record what it cost
         id: cost
@@ -1741,6 +1770,28 @@ jobs:
           elif [ -n "$why" ]; then
             echo "::warning title=Slack not notified::$why. The review is unaffected."
           fi
+
+      - name: Mark the start notice superseded
+        if: cancelled() && needs.agent.outputs.slack_ts != ''
+        continue-on-error: true
+        env:
+          BOT: ${{ secrets.LINDAMAR_SLACK_BOT_TOKEN }}
+          CH: ${{ secrets.LINDAMAR_SLACK_CHANNEL }}
+          START_TS: ${{ needs.agent.outputs.slack_ts }}
+          REPO: ${{ github.repository }}
+          PR: ${{ needs.agent.outputs.number }}
+          URL: ${{ needs.agent.outputs.url }}
+        run: |
+          # Best-effort, and never a failure: a cancelled run's notice is
+          # cosmetic. A webhook cannot edit, and no start message means
+          # nothing to edit. The token is sent as a header and never echoed.
+          [ -n "${BOT:-}" ] && [ -n "${CH:-}" ] && [ -n "${START_TS:-}" ] || exit 0
+          txt=":fast_forward: *<$URL|$REPO #$PR>* — superseded by a newer push"
+          curl -sS -m 15 -X POST -H "Authorization: Bearer $BOT" \
+            -H 'Content-type: application/json' \
+            -d "$(jq -n --arg c "$CH" --arg t "$START_TS" --arg x "$txt" '{channel:$c, ts:$t, text:$x}' || true)" \
+            https://slack.com/api/chat.update >/dev/null 2>&1 || true
+          echo "marked the start notice superseded"
 
   # Separate job, for one reason: it needs `statuses: write` and the review job
   # must not have it. A job-level permission belongs to every step in that job,
