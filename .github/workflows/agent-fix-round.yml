@@ -129,6 +129,9 @@ jobs:
             case "/$1/" in */../*|*/./*|*//*|/.github/*) return 1 ;; esac
           }
           path_ok "$lockfile" || fail "lockfile is not a plain repository path"
+          # bun 1.2+ writes the text bun.lock. The binary bun.lockb is read by
+          # nothing here, as in the review, so no task is started on it.
+          [ "$(basename "$lockfile")" != bun.lockb ] || fail "the binary bun.lockb is not supported: bun 1.2 and later write the text bun.lock"
           [[ "$slug" =~ ^[a-z0-9][a-z0-9-]{0,79}$ ]] || fail "slug must be lowercase letters, digits and dashes"
           case "$reason" in
             yarn_v1_lockfile|lockfile_unsupported|transitive_no_override|breaking_major)
@@ -147,8 +150,8 @@ jobs:
               # (or, for pnpm, will write) and the lockfiles that go.
               [ "$ecosystem" = npm ] || fail "a package-manager task is for npm projects"
               [ -z "$package$from$to" ] || fail "package, from and to belong to a package task"
-              case "$manager" in npm) own=package-lock.json ;; yarn) own=yarn.lock ;; pnpm) own=pnpm-lock.yaml ;;
-                *) fail "manager must be npm, yarn or pnpm" ;; esac
+              case "$manager" in npm) own=package-lock.json ;; yarn) own=yarn.lock ;; pnpm) own=pnpm-lock.yaml ;; bun) own=bun.lock ;;
+                *) fail "manager must be npm, yarn, pnpm or bun" ;; esac
               [ "$(basename "$lockfile")" = "$own" ] || fail "$manager's lockfile is $own, not $(basename "$lockfile")"
               printf '%s' "$TASK" | jq -e '(.remove // []) | type == "array" and length <= 3 and all(type == "string")' \
                 >/dev/null || fail "remove must be a list of at most three paths"
@@ -157,15 +160,18 @@ jobs:
                 path_ok "$r" || fail "a path to remove is not a plain repository path"
                 [ "$(dirname "$r")" = "$(dirname "$lockfile")" ] || fail "$r is not beside $lockfile"
                 [ "$r" != "$lockfile" ] || fail "the kept lockfile cannot also be removed"
-                case "$(basename "$r")" in package-lock.json|npm-shrinkwrap.json|yarn.lock|pnpm-lock.yaml) ;;
+                case "$(basename "$r")" in package-lock.json|npm-shrinkwrap.json|yarn.lock|pnpm-lock.yaml|bun.lock|bun.lockb) ;;
                   *) fail "$r is not a JS lockfile" ;; esac
+                # pnpm import reads npm's and Yarn's lockfiles, not bun's.
+                case "$reason:$(basename "$r")" in migrate_pnpm:bun.lock*) fail "pnpm import does not read $r; consolidate on one manager first" ;; esac
                 remove="$remove $r"
               done < <(printf '%s' "$TASK" | jq -r '(.remove // [])[]')
               remove="${remove# }"
               case "$reason" in
                 consolidate_lockfiles) [ -n "$remove" ] || fail "consolidating removes at least one lockfile" ;;
                 migrate_pnpm) [ "$manager" = pnpm ] && [ -n "$remove" ] || fail "a pnpm migration keeps pnpm and removes the old lockfile" ;;
-                harden_scripts) [ "$manager" != pnpm ] && [ -z "$remove" ] || fail "hardening is for npm or Yarn, and removes nothing" ;;
+                # bun runs no dependency's install script unless trustedDependencies names it.
+                harden_scripts) { [ "$manager" = npm ] || [ "$manager" = yarn ]; } && [ -z "$remove" ] || fail "hardening is for npm or Yarn, and removes nothing" ;;
               esac ;;
             *) fail "reason is not one Checkmate sends" ;;
           esac
@@ -362,6 +368,25 @@ jobs:
       - uses: astral-sh/setup-uv@v6
         if: needs.agent.outputs.ecosystem == 'pypi'
 
+      # bun for a bun.lock: the version package.json names, else the one the
+      # reviewer's bun.lock fixtures were written with.
+      - name: Which bun
+        id: bun
+        if: endsWith(needs.agent.outputs.lockfile, 'bun.lock')
+        env:
+          LOCKFILE: ${{ needs.agent.outputs.lockfile }}
+        run: |
+          set -euo pipefail
+          pm="$(jq -r '.packageManager // ""' "$(dirname "$LOCKFILE")/package.json" 2>/dev/null || true)"
+          v=1.4.4
+          [[ "$pm" =~ ^bun@([0-9]+\.[0-9]+\.[0-9]+)$ ]] && v="${BASH_REMATCH[1]}"
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      - uses: oven-sh/setup-bun@v2
+        if: steps.bun.outputs.version != ''
+        with:
+          bun-version: ${{ steps.bun.outputs.version }}
+
       - name: Regenerate the lockfile
         env:
           LOCKFILE: ${{ needs.agent.outputs.lockfile }}
@@ -417,6 +442,7 @@ jobs:
                 npm) pin "npm@$(npm --version)" ;;
                 yarn) if berry; then pin yarn@4.9.2; else pin yarn@1.22.22; fi ;;
                 pnpm) pin pnpm@10.34.6 ;;
+                bun) pin "bun@$(bun --version)" ;;
               esac
               cd - >/dev/null ;;
           esac
@@ -444,6 +470,12 @@ jobs:
                   yarn install --mode=update-lockfile ;;
                 *) echo "::error::package.json names $pm, not Yarn"; exit 1 ;;
               esac ;;
+            bun.lock)
+              # Resolve and write bun.lock only; --ignore-scripts skips the
+              # project's own scripts, and bun runs no dependency's by default.
+              bun install --lockfile-only --ignore-scripts ;;
+            bun.lockb)
+              echo "::error::the binary bun.lockb is not supported: bun 1.2 and later write the text bun.lock"; exit 1 ;;
             uv.lock)
               uv lock --no-build ;;
             *.txt)
@@ -481,7 +513,7 @@ jobs:
           dir="$(dirname "$LOCKFILE")"; base="$(basename "$LOCKFILE")"
           # 1. One JS lockfile per directory: two drift, and the review flags the stale one.
           n=0
-          for f in package-lock.json npm-shrinkwrap.json yarn.lock pnpm-lock.yaml; do [ -f "$dir/$f" ] && n=$((n + 1)); done
+          for f in package-lock.json npm-shrinkwrap.json yarn.lock pnpm-lock.yaml bun.lock bun.lockb; do [ -f "$dir/$f" ] && n=$((n + 1)); done
           [ "$n" -le 1 ] || fail "$dir has $n JS lockfiles; consolidate them first (Consolidate lockfiles)"
           # 2. Nothing under .github/ (the packaging step checks the staged change too).
           ! git status --porcelain -- .github | grep -q . || fail "the change touches .github/"
@@ -503,6 +535,9 @@ jobs:
                 corepack enable
                 case "$pm" in pnpm@*) pnpm install --frozen-lockfile --lockfile-only --ignore-scripts ;;
                   *) corepack pnpm@10.34.6 install --frozen-lockfile --lockfile-only --ignore-scripts ;; esac ;;
+              # A real install: bun has no dry run that checks the lockfile.
+              # node_modules is removed before the change is packaged.
+              bun.lock) bun install --frozen-lockfile --ignore-scripts ;;
               uv.lock) uv lock --check ;;
               *) true ;;
             esac
@@ -510,7 +545,7 @@ jobs:
           # 4. For a package task, the target version resolves in every lockfile
           #    that has the package, and the version it moves from is in none.
           if [ -n "$PACKAGE" ]; then
-            git ls-files -co --exclude-standard | grep -E '(^|/)(package-lock\.json|npm-shrinkwrap\.json|yarn\.lock|pnpm-lock\.yaml|uv\.lock|requirements[^/]*\.txt)$' \
+            git ls-files -co --exclude-standard | grep -E '(^|/)(package-lock\.json|npm-shrinkwrap\.json|yarn\.lock|pnpm-lock\.yaml|bun\.lock|uv\.lock|requirements[^/]*\.txt)$' \
               | grep -v '/node_modules/' > "$RUNNER_TEMP/lockfiles.txt" || true
             # The list is an argument: stdin is this script, and a second "<" would be dropped.
             python3 - "$PACKAGE" "$FROM" "$TO" "$LOCKFILE" "$RUNNER_TEMP/lockfiles.txt" <<'PY' || fail "$(cat "$RUNNER_TEMP/check.err" 2>/dev/null || echo "the target version does not resolve")"
@@ -549,6 +584,12 @@ jobs:
                           header = None
               elif base == "pnpm-lock.yaml":
                   for m in re.finditer(r"^\s{2}'?(@?[^@\s':]+)@([0-9][^(:'\s]*)", text, re.M):
+                      if m.group(1) == name:
+                          found.add(m.group(2))
+              elif base == "bun.lock":
+                  # "packages": { "<path>": ["<name>@<version>", ...] }; the name
+                  # ends at the first "@" after the first character.
+                  for m in re.finditer(r'^\s*"[^"]+":\s*\[\s*"(@?[^@"\s]+)@([^"\s]+)"', text, re.M):
                       if m.group(1) == name:
                           found.add(m.group(2))
               elif base == "uv.lock":
