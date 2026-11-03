@@ -193,6 +193,7 @@ jobs:
       blocked: ${{ steps.review.outputs.blocked }}
       reset_at: ${{ steps.review.outputs.resetAt }}
       limit: ${{ steps.review.outputs.limit }}
+      failed_step: ${{ steps.failed.outputs.step }}
       slack_ts: ${{ steps.slackstart.outputs.ts }}
       cost: ${{ steps.cost.outputs.cost }}
     timeout-minutes: ${{ inputs.timeout-minutes }}
@@ -591,6 +592,7 @@ jobs:
           skip carried "no change to this pull request's own diff since ${prev:0:8}; verdict $verdict carried from that review (approval carried: $approve)"
 
       - name: Check the credential before spending anything
+        id: cred
         if: steps.triage.outputs.skip == ''
         env:
           CRED: ${{ inputs.claude-credential }}
@@ -757,6 +759,7 @@ jobs:
           echo "token=$rtok" >> "$GITHUB_OUTPUT"
 
       - name: Check out the reviewer
+        id: checkout
         if: steps.already.outputs.skip != 'true' && steps.triage.outputs.skip == ''
         uses: actions/checkout@v4
         with:
@@ -790,6 +793,7 @@ jobs:
           node-version: "22"
 
       - name: Install the reviewer's skills, and verify the count
+        id: skills
         if: steps.already.outputs.skip != 'true' && steps.triage.outputs.skip == ''
         working-directory: .lindamar-reviewer
         run: |
@@ -824,6 +828,7 @@ jobs:
           npm_config_yes: "true"
 
       - name: Install the Claude CLI
+        id: cli
         if: steps.already.outputs.skip != 'true' && steps.triage.outputs.skip == ''
         run: |
           npm install -g "@anthropic-ai/claude-code@${LINDAMAR_CLAUDE_CLI_VERSION}"
@@ -1113,6 +1118,36 @@ jobs:
             ${{ runner.temp }}/stream.err
           retention-days: 1
           if-no-files-found: ignore
+
+      # Which step failed, for the Slack line: "did not run" with no reason
+      # was all a channel saw of a day of failed runs. Outcomes only, one per
+      # step, never the steps context whole: it carries the App token.
+      - name: Name the step that failed
+        id: failed
+        if: failure()
+        env:
+          O_PR: ${{ steps.pr.outcome }}
+          O_TRIAGE: ${{ steps.triage.outcome }}
+          O_CRED: ${{ steps.cred.outcome }}
+          O_ALREADY: ${{ steps.already.outcome }}
+          O_APP: ${{ steps.app.outcome }}
+          O_CHECKOUT: ${{ steps.checkout.outcome }}
+          O_SKILLS: ${{ steps.skills.outcome }}
+          O_CLI: ${{ steps.cli.outcome }}
+          O_REVIEW: ${{ steps.review.outcome }}
+        run: |
+          set -uo pipefail
+          for p in "Work out which pull request this is=${O_PR:-}" \
+                   "Decide whether this pull request needs a review=${O_TRIAGE:-}" \
+                   "Check the credential before spending anything=${O_CRED:-}" \
+                   "Stop early if this commit already has a verdict=${O_ALREADY:-}" \
+                   "Mint a reviewer App token=${O_APP:-}" \
+                   "Check out the reviewer=${O_CHECKOUT:-}" \
+                   "Install the reviewer's skills, and verify the count=${O_SKILLS:-}" \
+                   "Install the Claude CLI=${O_CLI:-}" \
+                   "Review=${O_REVIEW:-}"; do
+            if [ "${p##*=}" = failure ]; then echo "step=${p%=*}" >> "$GITHUB_OUTPUT"; echo "  first failed: ${p%=*}"; break; fi
+          done
 
 
   # The only job that writes. It runs no model, and the agent's output reaches it
@@ -1418,7 +1453,7 @@ jobs:
             msg="The review did not run: the reviewer's Claude credential hit $what${RESET_AT:+, which resets $RESET_AT}. This red check is not a verdict on the code, and nothing here is the author's to fix. Wait${RESET_AT:+ until it resets} and re-run this job (the automatic retry also tries again), or switch the reviewer to another Claude credential in the Checkmate console."
             echo "::error title=$title, nothing was reviewed::$msg"
             { echo "### $title, nothing was reviewed"; echo ""; echo "$msg"; } >> "$GITHUB_STEP_SUMMARY"
-            { echo "limit_title=$title"; echo "limit_msg=$msg"; } >> "$GITHUB_OUTPUT"
+            { echo "limit_title=$title"; echo "limit_msg=$msg"; echo "limit_reset=$RESET_AT"; } >> "$GITHUB_OUTPUT"
             exit 1
           fi
           # Triage decided no review was needed. Green, with the reason on the
@@ -1769,12 +1804,29 @@ jobs:
           REVIEW_RAN: ${{ needs.agent.outputs.ran }}
           COST: ${{ needs.agent.outputs.cost }}
           LIMIT_TITLE: ${{ steps.gate.outputs.limit_title }}
+          LIMIT_RESET: ${{ steps.gate.outputs.limit_reset }}
+          FAILED_STEP: ${{ needs.agent.outputs.failed_step }}
+          BLOCKED: ${{ needs.agent.outputs.blocked }}
         run: |
           # Best-effort throughout: a notification failing must never fail a
           # review that already happened.
           cost="${COST:-not recorded}"
           if [ "$REVIEW_RAN" != "true" ]; then
-            emoji=":warning:"; verdict="did not run — ${LIMIT_TITLE:+$LIMIT_TITLE, }nothing was checked"
+            # The reason, short, as the check gives it. The step name is one of
+            # a fixed list in the agent job, and is checked anyway: it goes
+            # into Slack markup.
+            printf '%s' "${FAILED_STEP:-}" | grep -Eq "^[A-Za-z' ,-]{1,60}$" || FAILED_STEP=""
+            if [ -n "${LIMIT_TITLE:-}" ]; then why="$LIMIT_TITLE${LIMIT_RESET:+, resets $LIMIT_RESET}"
+            elif [ "$FAILED_STEP" = Review ]; then
+              case "${BLOCKED:-}" in
+                auth) why="the Claude credential was refused" ;;
+                nowork) why="the reviewer did no work" ;;
+                *) why="the reviewer failed" ;;
+              esac
+            elif [ -n "$FAILED_STEP" ]; then why="a step before the review failed: $FAILED_STEP"
+            else why=""
+            fi
+            emoji=":warning:"; verdict="did not run — ${why:+$why — }nothing was checked"
           elif [ "$GATE" = "success" ]; then
             emoji=":white_check_mark:"; verdict="nothing blocking"
           else
