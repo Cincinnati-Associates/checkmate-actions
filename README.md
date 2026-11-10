@@ -74,6 +74,18 @@ jobs:
 
 Only one of `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN` is needed. Every other secret is optional, and each is described in the workflow's `secrets:` block.
 
+### A subscription that people also use
+
+With `claude-credential: subscription`, reviews and people draw on the same 5-hour and weekly windows. `usage-reserve-percent` keeps a share of both free:
+
+```yaml
+    with:
+      claude-credential: subscription
+      usage-reserve-percent: 20
+```
+
+With 20, a review does not start once either window is 80% used or more. The required check goes red and says which window it was and when it resets, and the review itself spends nothing. The default is 0: no reserve. The check runs before a review starts, so a review that starts just under the line can still cross it.
+
 ## Tokens
 
 Each job asks Checkmate (`POST <checkmate-url>/v1/actions/token`) for only the tokens it uses:

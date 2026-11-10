@@ -84,6 +84,10 @@ on:
         description: "Most rounds that run the model on one pull request before a push stops starting one by itself. Each round is a full paid review; one pull request in an earlier incident reached nine in a few hours. At the cap, and while the last round blocked, the check fails without spending and says to fix everything in one push and start the next review by hand. A hand-started run is never capped; it skips only a commit that already has a verdict, unless a person started it and that verdict blocks, in which case it rules again. 0 means no cap."
         type: number
         default: 3
+      usage-reserve-percent:
+        description: "Share of the Claude subscription that a review must leave free, as a whole percent of the 5-hour window and of the weekly window. With 20, a review does not start once either window is 80% used or more: the check goes red with which window it was and when it resets, as for a usage limit, and no tokens are spent on the review. For a subscription that people also work on. It is checked before a review starts, so a review that starts just under the line can still cross it. Only with `claude-credential: subscription`; an API key has no windows. 0 means no reserve."
+        type: number
+        default: 0
       model:
         description: "Pinned so cost does not depend on which machine ran the review. Unpinned, the same pull request cost $11-13 locally on opus-1m at 34-36k output tokens and $2.29-2.75 in CI at 12-15k — a 4x spread that makes any per-repo quote meaningless."
         type: string
@@ -190,9 +194,9 @@ jobs:
       scope_total: ${{ steps.triage.outputs.scope_total }}
       already: ${{ steps.already.outputs.skip }}
       ran: ${{ steps.review.outputs.ran }}
-      blocked: ${{ steps.review.outputs.blocked }}
-      reset_at: ${{ steps.review.outputs.resetAt }}
-      limit: ${{ steps.review.outputs.limit }}
+      blocked: ${{ steps.reserve.outputs.blocked || steps.review.outputs.blocked }}
+      reset_at: ${{ steps.reserve.outputs.resetAt || steps.review.outputs.resetAt }}
+      limit: ${{ steps.reserve.outputs.limit || steps.review.outputs.limit }}
       failed_step: ${{ steps.failed.outputs.step }}
       slack_ts: ${{ steps.slackstart.outputs.ts }}
       cost: ${{ steps.cost.outputs.cost }}
@@ -828,8 +832,60 @@ jobs:
           npm install -g "@anthropic-ai/claude-code@${LINDAMAR_CLAUDE_CLI_VERSION}"
           claude --version
 
+      # Off unless the caller sets usage-reserve-percent. The CLI reports how
+      # much of each subscription window is used in the `rate_limit_event` of
+      # any request (`unifiedWindows.<window>.utilization`, 0 to 1; measured on
+      # the pinned 2.1.296), so one Haiku turn reads it for a fraction of a cent.
+      # A reserve that is reached takes the usage-limit path: `blocked=usage`
+      # and a `limit` the gate names. Anything unreadable starts the review.
+      - name: Keep the usage reserve free
+        id: reserve
+        if: steps.already.outputs.skip != 'true' && steps.triage.outputs.skip == '' && inputs.usage-reserve-percent > 0 && inputs.claude-credential == 'subscription'
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          RESERVE: ${{ inputs.usage-reserve-percent }}
+        run: |
+          set -uo pipefail
+          case "${RESERVE:-}" in
+            ''|*[!0-9]*) echo "::warning title=Usage reserve not checked::usage-reserve-percent is '${RESERVE:-}', not a whole percent from 1 to 99."; exit 0 ;;
+          esac
+          if [ "$RESERVE" -lt 1 ] || [ "$RESERVE" -gt 99 ]; then
+            echo "::warning title=Usage reserve not checked::usage-reserve-percent is $RESERVE, not a whole percent from 1 to 99."; exit 0
+          fi
+          S="$RUNNER_TEMP/reserve.jsonl"
+          env -u GITHUB_OUTPUT -u GITHUB_ENV -u GITHUB_PATH -u GITHUB_STEP_SUMMARY -u GITHUB_STATE \
+              -u ACTIONS_ID_TOKEN_REQUEST_URL -u ACTIONS_ID_TOKEN_REQUEST_TOKEN \
+          claude -p "Reply with the single word ok." --model haiku --max-turns 1 \
+            --output-format stream-json --verbose </dev/null > "$S" 2>/dev/null || true
+          # One line per window over the line, the weekly one first: it is the
+          # longer wait. "<limit> <used percent> <reset epoch or ->".
+          over="$(jq -s -r --argjson reserve "$RESERVE" '
+              ([ .[] | select(.type == "rate_limit_event") | .rate_limit_info.unifiedWindows | objects ] | last) as $w
+              | [ { limit: "reserve-weekly",  w: $w.seven_day? },
+                  { limit: "reserve-session", w: $w.five_hour? } ]
+              | map(select((.w.utilization? | type) == "number"))
+              | if length == 0 then error("no usage windows") else .[] end
+              | select(.w.utilization * 100 >= 100 - $reserve)
+              | "\(.limit) \(.w.utilization * 100 | floor) \(.w.resetsAt // "-")"' "$S" 2>/dev/null)" || {
+            echo "::warning title=Usage reserve not checked::The Claude CLI did not report how much of the subscription is used, so the review starts without the reserve check."
+            exit 0
+          }
+          if [ -z "$over" ]; then
+            echo "  usage reserve: both windows are under $(( 100 - RESERVE ))% used; reviewing"
+            exit 0
+          fi
+          read -r limit used reset <<< "$(printf '%s\n' "$over" | head -1)" || true
+          at=""
+          case "${reset:-}" in ''|*[!0-9]*) ;; *) at="$(jq -rn --argjson t "$reset" '$t | strftime("%Y-%m-%d %H:%M UTC")' 2>/dev/null || true)" ;; esac
+          {
+            echo "blocked=usage"
+            echo "limit=$limit"
+            [ -z "$at" ] || echo "resetAt=$at"
+          } >> "$GITHUB_OUTPUT"
+          echo "::warning title=Usage reserve reached, nothing was reviewed::${limit#reserve-} window is ${used}% used and usage-reserve-percent keeps ${RESERVE}% free${at:+; it resets $at}. The required check says what to do."
+
       - name: Say in Slack that a review started
-        if: always() && steps.already.outputs.skip != 'true' && steps.triage.outputs.skip == ''
+        if: always() && steps.already.outputs.skip != 'true' && steps.triage.outputs.skip == '' && steps.reserve.outputs.blocked == ''
         id: slackstart
         env:
           BOT: ${{ secrets.LINDAMAR_SLACK_BOT_TOKEN }}
@@ -868,7 +924,7 @@ jobs:
           fi
 
       - name: Review
-        if: steps.already.outputs.skip != 'true' && steps.triage.outputs.skip == ''
+        if: steps.already.outputs.skip != 'true' && steps.triage.outputs.skip == '' && steps.reserve.outputs.blocked == ''
         id: review
         working-directory: .lindamar-reviewer
         env:
@@ -1471,6 +1527,8 @@ jobs:
               credit)   title="Claude credit balance too low";    what="the end of its API credit balance or usage credits" ;;
               api-rate) title="Claude API rate limit reached";    what="the Anthropic API rate limit" ;;
               server)   title="Claude API is limiting requests";  what="a server-side limit on Anthropic's end (not the credential's own usage)" ;;
+              reserve-session) title="Claude 5-hour usage reserve reached"; what="the share of its Claude subscription's 5-hour session limit that this repository keeps free (usage-reserve-percent)" ;;
+              reserve-weekly)  title="Claude weekly usage reserve reached"; what="the share of its Claude subscription's weekly limit that this repository keeps free (usage-reserve-percent)" ;;
               *)        title="Claude usage limit reached";       what="a Claude usage limit the CLI did not name" ;;
             esac
             msg="The review did not run: the reviewer's Claude credential hit $what${RESET_AT:+, which resets $RESET_AT}. This red check is not a verdict on the code, and nothing here is the author's to fix. Wait${RESET_AT:+ until it resets} and re-run this job (the automatic retry also tries again), or switch the reviewer to another Claude credential in the Checkmate console."
