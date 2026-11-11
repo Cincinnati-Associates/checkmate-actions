@@ -86,6 +86,16 @@ With `claude-credential: subscription`, reviews and people draw on the same 5-ho
 
 With 20, a review does not start once either window is 80% used or more. The required check goes red and says which window it was and when it resets, and the review itself spends nothing. The default is 0: no reserve. The check runs before a review starts, so a review that starts just under the line can still cross it.
 
+### Runner
+
+Every job runs on `ubuntu-latest`, which uses the calling organisation's GitHub Actions minutes. To use other runners, set the `LINDAMAR_RUNNER` Actions variable on the calling repository or organisation:
+
+```sh
+gh variable set LINDAMAR_RUNNER --org <org> --visibility all --body blacksmith-2vcpu-ubuntu-2404-arm
+```
+
+The jobs wait on the Claude API and do no builds, so the smallest runner is enough. The caller file does not change. Delete the variable to go back to `ubuntu-latest`.
+
 ## Tokens
 
 Each job asks Checkmate (`POST <checkmate-url>/v1/actions/token`) for only the tokens it uses:

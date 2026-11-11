@@ -112,7 +112,7 @@ jobs:
   # credential, runs no agent, and hands on only the skill files.
   skills:
     name: Checkmate agent fix (review skills)
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.LINDAMAR_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 10
     permissions:
       contents: read
@@ -291,7 +291,7 @@ jobs:
     name: Checkmate agent fix (which pass publishes)
     needs: [round1, round2, round3]
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.LINDAMAR_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 5
     permissions:
       contents: read
@@ -351,7 +351,7 @@ jobs:
     name: Checkmate agent fix (pull request)
     needs: decide
     if: needs.decide.outputs.round != ''
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.LINDAMAR_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 10
     permissions:
       contents: read

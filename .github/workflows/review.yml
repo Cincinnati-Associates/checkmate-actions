@@ -177,7 +177,7 @@ jobs:
   # fails if it does, or if this job asks for any write scope.
   agent:
     name: Lindamar agent
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.LINDAMAR_RUNNER || 'ubuntu-latest' }}
     outputs:
       sha: ${{ steps.pr.outputs.sha }}
       number: ${{ steps.pr.outputs.number }}
@@ -1244,7 +1244,7 @@ jobs:
     name: Lindamar review
     needs: agent
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.LINDAMAR_RUNNER || 'ubuntu-latest' }}
     outputs:
       gate: ${{ steps.gate.outcome }}
     timeout-minutes: 15
@@ -2012,7 +2012,7 @@ jobs:
     # nothing anywhere saying why. That failure path is exactly the one this job
     # exists for.
     if: always() && inputs.pr != ''
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.LINDAMAR_RUNNER || 'ubuntu-latest' }}
     permissions:
       # read, so this job can find the head sha itself when the review job died
       # before publishing it.
