@@ -200,6 +200,7 @@ jobs:
       failed_step: ${{ steps.failed.outputs.step }}
       slack_ts: ${{ steps.slackstart.outputs.ts }}
       cost: ${{ steps.cost.outputs.cost }}
+      replies: ${{ steps.draft_replies.outputs.count }}
     timeout-minutes: ${{ inputs.timeout-minutes }}
     permissions:
       contents: read
@@ -1100,6 +1101,86 @@ jobs:
           retention-days: 1
           if-no-files-found: error
 
+      # ANSWERING A PERSON WHO REPLIED IN ONE OF THE REVIEWER'S THREADS.
+      #
+      # post-review.sh leaves a thread a person replied to open, because the
+      # reply may be a question or a disagreement, and nothing then read it: the
+      # next round posted its verdict again and the question sat there. These
+      # two steps find those threads and draft an answer; the post job checks
+      # each draft against the threads as they are by then, and posts it.
+      #
+      # Split like the review itself. Finding the threads needs the read token
+      # and no model credential; drafting needs the model credential and no
+      # GitHub token or OIDC request variable at all, runs with no tools, and
+      # gets the thread's text fenced as data (the reviewer's
+      # scripts/thread-replies.sh). Both are best effort: continue-on-error,
+      # so nothing here can fail the review or the gate.
+      #
+      # Only on a round that ran the model, a subset round included. A carried,
+      # skipped or already-ruled run checks out no reviewer and installs no
+      # CLI, and its check says no model ran; spending on it would make that
+      # untrue. Nothing is lost: the selection reads the threads afresh each
+      # time, so a reply waits for the next round that runs the model.
+      - name: Find the threads a person is waiting on
+        id: collect_replies
+        if: steps.review.outputs.ran == 'true'
+        continue-on-error: true
+        # A step's own timeout ends only the step, which continue-on-error
+        # then forgives; the job's would fail the run and with it the gate.
+        timeout-minutes: 5
+        working-directory: .lindamar-reviewer
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ steps.pr.outputs.number }}
+          SHA: ${{ steps.pr.outputs.sha }}
+        run: |
+          set -uo pipefail
+          # A reviewer ref from before this step has no script to run.
+          [ -f scripts/thread-replies.sh ] || { echo "this reviewer ref does not answer replies"; exit 0; }
+          # Emptied first: the review step's agent could write anywhere on disk,
+          # and nothing it left here is a draft.
+          rm -rf "$RUNNER_TEMP/replies"; mkdir -p "$RUNNER_TEMP/replies"
+          # Without the runner's file commands, like the review step: the
+          # script is in a checkout the review's agent could have rewritten.
+          env -u GITHUB_OUTPUT -u GITHUB_ENV -u GITHUB_PATH -u GITHUB_STATE \
+          bash scripts/thread-replies.sh collect --repo "$REPO" --pr "$PR" --head "$SHA" \
+            --out "$RUNNER_TEMP/replies" --max 5
+          echo "count=$(jq 'length' "$RUNNER_TEMP/replies/threads.json" 2>/dev/null || echo 0)" >> "$GITHUB_OUTPUT"
+
+      # Sonnet, not the review's model: a reply is one turn of about 2k tokens
+      # in and 250 out, the rule-checkable kind of work the reviewer's own
+      # stacks.json already gives Sonnet. Measured on the pinned CLI: $0.0104
+      # for one reply, so the cap of five bounds a round's replies to about
+      # five cents.
+      - name: Draft replies in those threads
+        id: draft_replies
+        if: steps.collect_replies.outputs.count != '' && steps.collect_replies.outputs.count != '0'
+        continue-on-error: true
+        timeout-minutes: 5
+        working-directory: .lindamar-reviewer
+        env:
+          ANTHROPIC_API_KEY: ${{ inputs.claude-credential == 'api-key' && secrets.ANTHROPIC_API_KEY || '' }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ inputs.claude-credential == 'subscription' && secrets.CLAUDE_CODE_OAUTH_TOKEN || '' }}
+          LINDAMAR_REPLY_MODEL: sonnet
+        run: |
+          set -uo pipefail
+          env -u GITHUB_OUTPUT -u GITHUB_ENV -u GITHUB_PATH -u GITHUB_STATE \
+          bash scripts/thread-replies.sh draft --in "$RUNNER_TEMP/replies/threads.json" \
+            --out "$RUNNER_TEMP/replies/replies.json" --max 5
+          echo "count=$(jq 'length' "$RUNNER_TEMP/replies/replies.json" 2>/dev/null || echo 0)" >> "$GITHUB_OUTPUT"
+
+      # The drafts, as data, for the post job, which validates each one before
+      # it posts anything. They quote the threads, so a day's retention.
+      - uses: actions/upload-artifact@v4
+        if: steps.draft_replies.outputs.count != '' && steps.draft_replies.outputs.count != '0'
+        continue-on-error: true
+        with:
+          name: lindamar-review-replies-${{ steps.pr.outputs.number }}
+          path: ${{ runner.temp }}/replies/replies.json
+          retention-days: 1
+          if-no-files-found: ignore
+
       # A run a newer push cancelled left its ":mag: reviewing…" for good: the
       # step that edits it runs only on !cancelled(). This one runs only on
       # cancelled(), here and again in the review job, for a cancel in either.
@@ -1361,6 +1442,13 @@ jobs:
           name: lindamar-review-handoff-${{ needs.agent.outputs.number }}
           path: ${{ runner.temp }}/handoff
 
+      - uses: actions/download-artifact@v4
+        if: needs.agent.outputs.replies != '' && needs.agent.outputs.replies != '0'
+        continue-on-error: true
+        with:
+          name: lindamar-review-replies-${{ needs.agent.outputs.number }}
+          path: ${{ runner.temp }}/replies
+
       # The agent's output is untrusted: it was written by a model that read text
       # anyone can put in a diff. It is checked for shape and stripped to the
       # fields a finding may carry — a planted `preExisting` or `carriedFrom`
@@ -1465,6 +1553,28 @@ jobs:
             3) echo "  nothing new to post; the gate reads the existing signed verdict" ;;
             *) echo "::error title=Could not post the review::post-review.sh exited $rc."; exit "$rc" ;;
           esac
+
+      # The agent job's drafts are untrusted like its review: each is posted only
+      # if its thread is still the reviewer's and open, the comment it answers
+      # is a person's and not answered yet (the `lindamar-review-reply:<id>`
+      # marker), and the text is not empty and under the cap; hidden markers
+      # and @mentions are neutralised, and a fixed line says the verdict is
+      # unchanged. Only after the review posted, and best effort: a failure is
+      # a warning and never reaches the gate below.
+      - name: Answer people in the reviewer's threads
+        if: steps.post.outcome == 'success' && needs.agent.outputs.replies != '' && needs.agent.outputs.replies != '0'
+        continue-on-error: true
+        timeout-minutes: 3
+        working-directory: .lindamar-reviewer
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ needs.agent.outputs.number }}
+        run: |
+          set -uo pipefail
+          [ -f scripts/thread-replies.sh ] || { echo "this reviewer ref does not answer replies"; exit 0; }
+          bash scripts/thread-replies.sh post --repo "$REPO" --pr "$PR" \
+            --replies "$RUNNER_TEMP/replies/replies.json" --max 5
 
       - name: Gate on critical findings
         id: gate
