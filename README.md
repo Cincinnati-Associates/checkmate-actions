@@ -72,7 +72,7 @@ jobs:
 
 `id-token: write` must be granted by the calling job. A reusable workflow cannot raise its caller's permissions. Without it, the token step fails with an error that says so.
 
-Only one of `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN` is needed. Every other secret is optional, and each is described in the workflow's `secrets:` block.
+Only one of `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN` is needed, or `OPENROUTER_API_KEY` with `claude-credential: openrouter` (below). Every other secret is optional, and each is described in the workflow's `secrets:` block.
 
 ### A subscription that people also use
 
@@ -85,6 +85,26 @@ With `claude-credential: subscription`, reviews and people draw on the same 5-ho
 ```
 
 With 20, a review does not start once either window is 80% used or more. The required check goes red and says which window it was and when it resets, and the review itself spends nothing. The default is 0: no reserve. The check runs before a review starts, so a review that starts just under the line can still cross it.
+
+### Another model through OpenRouter (Preview)
+
+`claude-credential: openrouter` runs the same CLI, skills and sub-agents on a non-Claude model, an OpenAI one for example, through OpenRouter's Anthropic-compatible endpoint. Add an `OPENROUTER_API_KEY` secret, with a credit limit on the key, and pass it with the other secrets:
+
+```yaml
+    secrets:
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+    with:
+      claude-credential: openrouter
+      model: openai/gpt-6.2-sol
+```
+
+- `model` must be an OpenRouter id (`vendor/model`). Every model slot of the CLI is pinned to it, so sub-agents and background calls do not fall back to Claude.
+- To bill your own OpenAI key, attach it to the OpenRouter account as a BYOK key and set its shared-capacity fallback to "never". Otherwise OpenRouter bills its own credits.
+- The diff goes to OpenRouter and to the model's provider. Both must be acceptable processors of the repository's code.
+- The CLI's cost figure is not a real cost for these models. The run summary says "billed by OpenRouter": read the usage of the key there.
+- Review quality on non-Claude models has not been measured to the bar Claude is held to. Read the verdict as advisory until it has been.
+
+Only the review uses this credential. Agent fixes still need a Claude credential.
 
 ### Runner
 

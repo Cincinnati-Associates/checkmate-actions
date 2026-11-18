@@ -70,7 +70,7 @@ on:
         type: boolean
         default: true
       claude-credential:
-        description: "api-key or subscription. CI should use api-key: a subscription token is a person's own credential and bills to them."
+        description: "api-key, subscription or openrouter. CI should use api-key: a subscription token is a person's own credential and bills to them. openrouter is a Preview: the same CLI, skills and sub-agents run on a non-Claude model, such as an OpenAI one, through OpenRouter's Anthropic-compatible endpoint, billed to OPENROUTER_API_KEY or to a provider key attached to that OpenRouter account (BYOK). It needs `model` set to an OpenRouter id such as openai/gpt-6.2-sol, and every model slot is pinned to it. Review quality on non-Claude models has not been measured to the bar Claude is held to, the CLI's cost figure is not a real cost on this path, and the diff goes to OpenRouter and to the model's provider, so both must be acceptable processors of this repository's code."
         type: string
         default: api-key
       reviewer-ref:
@@ -113,6 +113,9 @@ on:
         description: "Set per repo, so each client's review cost bills to that client."
         required: false
       CLAUDE_CODE_OAUTH_TOKEN:
+        required: false
+      OPENROUTER_API_KEY:
+        description: "Only with `claude-credential: openrouter`. Set per repo, like ANTHROPIC_API_KEY, and give the key a credit limit on OpenRouter."
         required: false
       LINDAMAR_SLACK_BOT_TOKEN:
         description: "Bot token with chat:write. Preferred over the webhook: a webhook's messages belong to the webhook, so nothing can later edit or delete them — proven by chat.delete returning cant_delete_message on them while the same token deletes its own posts fine. With a bot token the run posts once and edits that message into the result, instead of leaving two."
@@ -603,6 +606,8 @@ jobs:
           CRED: ${{ inputs.claude-credential }}
           API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           OAUTH: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          OR_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          MODEL: ${{ inputs.model }}
         run: |
           case "$CRED" in
             api-key)
@@ -616,8 +621,20 @@ jobs:
                 exit 1
               fi
               echo "::warning title=Subscription credential in CI::A subscription token is an individual's own credential and bills to them. Any workflow in this repo can read it. api-key with a spend cap is the right credential for CI." ;;
+            openrouter)
+              if [ -z "$OR_KEY" ]; then
+                echo "::error title=Missing OPENROUTER_API_KEY::claude-credential is 'openrouter' but no OPENROUTER_API_KEY reached this workflow. Add it in Settings → Secrets and variables → Actions, and pass it in the caller's secrets."
+                exit 1
+              fi
+              # An OpenRouter id is vendor/model. The default, claude-opus-5, is
+              # not one, and a run that guessed would bill a model nobody chose.
+              if ! [[ "$MODEL" =~ ^[a-z0-9][a-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._:-]*$ ]]; then
+                echo "::error title=No OpenRouter model::claude-credential is 'openrouter', so model must be an OpenRouter id such as openai/gpt-6.2-sol."
+                exit 1
+              fi
+              echo "::warning title=OpenRouter credential is a Preview::This review runs on $MODEL through OpenRouter. Review quality on non-Claude models has not been measured to the bar Claude is held to, so read its verdict as advisory until it has been." ;;
             *)
-              echo "::error title=Unknown credential mode::claude-credential must be 'api-key' or 'subscription', got '$CRED'."
+              echo "::error title=Unknown credential mode::claude-credential must be 'api-key', 'subscription' or 'openrouter', got '$CRED'."
               exit 1 ;;
           esac
 
@@ -936,6 +953,8 @@ jobs:
           LINDAMAR_REVIEW_SHA: ${{ steps.pr.outputs.sha }}
           LINDAMAR_VERDICT_MODE: ${{ inputs.verdict-mode }}
           LINDAMAR_MODEL: ${{ inputs.model }}
+          LINDAMAR_CREDENTIAL: ${{ inputs.claude-credential }}
+          LINDAMAR_OPENROUTER_KEY: ${{ inputs.claude-credential == 'openrouter' && secrets.OPENROUTER_API_KEY || '' }}
           # Wait for every sub-agent. The orchestrator launches its reviewers in
           # the background and can end its turn while one is still working; in
           # print mode the CLI then waits 10 minutes and kills it, the run ends
@@ -955,6 +974,20 @@ jobs:
           set -uo pipefail
           mkdir -p "$RUNNER_TEMP/state"
           export LINDAMAR_STATE_DIR="$RUNNER_TEMP/state"
+          # claude-credential: openrouter (Preview). Every model slot is pinned
+          # to the one model: with only --model set, sub-agents and the CLI's
+          # background calls ran on Claude through the OpenRouter key, at
+          # Claude's prices (docs/PLAN.md section 8, measured 2026-09-30).
+          # ANTHROPIC_API_KEY stays empty so the CLI cannot fall back to
+          # Anthropic. On every other credential nothing here is set.
+          if [ "${LINDAMAR_CREDENTIAL:-}" = openrouter ]; then
+            export ANTHROPIC_BASE_URL="https://openrouter.ai/api" ANTHROPIC_AUTH_TOKEN="${LINDAMAR_OPENROUTER_KEY:-}" ANTHROPIC_API_KEY=""
+            for v in ANTHROPIC_MODEL ANTHROPIC_DEFAULT_OPUS_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL \
+                     ANTHROPIC_DEFAULT_HAIKU_MODEL ANTHROPIC_SMALL_FAST_MODEL CLAUDE_CODE_SUBAGENT_MODEL; do
+              export "$v=${LINDAMAR_MODEL:-}"
+            done
+          fi
+          unset LINDAMAR_OPENROUTER_KEY
           # `|| rc=$?`, not a bare call followed by `rc=$?`. GitHub runs a `run:`
           # block under `bash -e`, so a failing CLI aborted the step on that very
           # line and every line below — the ones that exist to say WHY it failed —
@@ -1042,8 +1075,11 @@ jobs:
               *"not your usage limit"*) limit=server ;;
               *"5-hour limit"*|*"session limit"*) limit=session ;;
               *"opus limit"*|*"sonnet limit"*|*"fable limit"*) limit=model ;;
+              # An OpenRouter key's own budget, "Budget limit exceeded (weekly
+              # limit)", before the subscription's weekly limit it would match.
+              *"budget limit exceeded"*) limit=credit ;;
               *"weekly limit"*) limit=weekly ;;
-              *"credit balance"*|*"out of usage credits"*|*"out of extra usage"*|*"usage credit limit"*|*"out of credit"*|*"spend limit"*|*error=billing_error*) limit=credit ;;
+              *"credit balance"*|*"out of usage credits"*|*"out of extra usage"*|*"usage credit limit"*|*"out of credit"*|*"spend limit"*|*error=billing_error*|*"insufficient credits"*|*"more credits"*|*"api error: 402"*) limit=credit ;;
               *rate_limit_error*|*error=rate_limit*|*"rate limit"*|*rate_limit*) limit=api-rate ;;
               *"usage limit"*|*usage_limit*|*quota*) limit=unknown ;;
               *authentication*|*unauthorized*|*"invalid api key"*|*"invalid token"*|*oauth*) blocked=auth ;;
@@ -1163,8 +1199,25 @@ jobs:
           ANTHROPIC_API_KEY: ${{ inputs.claude-credential == 'api-key' && secrets.ANTHROPIC_API_KEY || '' }}
           CLAUDE_CODE_OAUTH_TOKEN: ${{ inputs.claude-credential == 'subscription' && secrets.CLAUDE_CODE_OAUTH_TOKEN || '' }}
           LINDAMAR_REPLY_MODEL: sonnet
+          LINDAMAR_MODEL: ${{ inputs.model }}
+          LINDAMAR_CREDENTIAL: ${{ inputs.claude-credential }}
+          LINDAMAR_OPENROUTER_KEY: ${{ inputs.claude-credential == 'openrouter' && secrets.OPENROUTER_API_KEY || '' }}
         run: |
           set -uo pipefail
+          # claude-credential: openrouter (Preview). Every model slot is pinned
+          # to the one model: with only --model set, sub-agents and the CLI's
+          # background calls ran on Claude through the OpenRouter key, at
+          # Claude's prices (docs/PLAN.md section 8, measured 2026-09-30).
+          # ANTHROPIC_API_KEY stays empty so the CLI cannot fall back to
+          # Anthropic. On every other credential nothing here is set.
+          if [ "${LINDAMAR_CREDENTIAL:-}" = openrouter ]; then
+            export ANTHROPIC_BASE_URL="https://openrouter.ai/api" ANTHROPIC_AUTH_TOKEN="${LINDAMAR_OPENROUTER_KEY:-}" ANTHROPIC_API_KEY=""
+            for v in ANTHROPIC_MODEL ANTHROPIC_DEFAULT_OPUS_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL \
+                     ANTHROPIC_DEFAULT_HAIKU_MODEL ANTHROPIC_SMALL_FAST_MODEL CLAUDE_CODE_SUBAGENT_MODEL LINDAMAR_REPLY_MODEL; do
+              export "$v=${LINDAMAR_MODEL:-}"
+            done
+          fi
+          unset LINDAMAR_OPENROUTER_KEY
           env -u GITHUB_OUTPUT -u GITHUB_ENV -u GITHUB_PATH -u GITHUB_STATE \
           bash scripts/thread-replies.sh draft --in "$RUNNER_TEMP/replies/threads.json" \
             --out "$RUNNER_TEMP/replies/replies.json" --max 5
@@ -1226,7 +1279,10 @@ jobs:
             | ($ev | map(select(.type=="assistant") | .message.usage // empty)) as $u
             | { repo:$repo, pr:($pr|tonumber), sha:$sha, credential:$cred,
                 complete: ($r != null),
-                costUsd: (if $r then $r.total_cost_usd else null end),
+                # On OpenRouter the CLI prices a model it does not know: $3.93
+                # against a real $1.67 (docs/PLAN.md section 8). Kept, labelled.
+                costUsd: (if $r and $cred != "openrouter" then $r.total_cost_usd else null end),
+                cliCostUsd: (if $r and $cred == "openrouter" then $r.total_cost_usd else null end),
                 resultSubtype: (if $r then ($r.subtype // null) else null end),
                 isError: (if $r then ($r.is_error // false) else null end),
                 costBasis: (if $r then ([$r.modelUsage[]?.costBasis]|first) else null end),
@@ -1237,17 +1293,19 @@ jobs:
                 turns: (if $r then $r.num_turns else null end),
                 durationMs: (if $r then $r.duration_api_ms else null end),
                 models: (if $r then ($r.modelUsage | keys) else [] end),
-                note: (if $r then null else "run did not finish; usage is a lower bound" end) }
+                note: (if $r == null then "run did not finish; usage is a lower bound"
+                       elif $cred == "openrouter" then "OpenRouter bills this run; the real cost is in the usage of the key on OpenRouter"
+                       else null end) }
           ' "$S" > "$RUNNER_TEMP/cost.json"
           cat "$RUNNER_TEMP/cost.json"
           {
             echo "### Review cost"
             echo ""
-            jq -r '"- repo: `\(.repo)` PR #\(.pr)\n- credential: `\(.credential)`\n- cost: \(if .costUsd then "$" + (.costUsd|tostring) + " (basis: " + (.costBasis // "?") + ")" else "not recorded — the run did not finish, so this is **not** free" end)\n- output tokens: \(.outputTokens)\n- agents: \(.subagents // "?")  turns: \(.turns // "?")"' \
+            jq -r '"- repo: `\(.repo)` PR #\(.pr)\n- credential: `\(.credential)`\n- cost: \(if .costUsd then "$" + (.costUsd|tostring) + " (basis: " + (.costBasis // "?") + ")" elif .credential == "openrouter" and .complete then "billed by OpenRouter, see the usage of the key there (the figure the CLI reports, not a real cost: $" + ((.cliCostUsd // 0)|tostring) + ")" else "not recorded — the run did not finish, so this is **not** free" end)\n- output tokens: \(.outputTokens)\n- agents: \(.subagents // "?")  turns: \(.turns // "?")"' \
               "$RUNNER_TEMP/cost.json"
           } >> "$GITHUB_STEP_SUMMARY"
           # For the Slack line, which the post job writes.
-          echo "cost=$(jq -r 'if .costUsd then "$" + ((.costUsd*100|round/100)|tostring) else "not recorded" end' "$RUNNER_TEMP/cost.json" 2>/dev/null || echo "not recorded")" >> "$GITHUB_OUTPUT"
+          echo "cost=$(jq -r 'if .costUsd then "$" + ((.costUsd*100|round/100)|tostring) elif .credential == "openrouter" then "billed by OpenRouter" else "not recorded" end' "$RUNNER_TEMP/cost.json" 2>/dev/null || echo "not recorded")" >> "$GITHUB_OUTPUT"
 
       # The raw transcript is NOT uploaded. It quotes the diff, so in a client
       # repo it is that client's source, and a review that finds a committed
