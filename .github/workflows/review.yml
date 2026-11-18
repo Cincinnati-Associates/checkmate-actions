@@ -73,6 +73,18 @@ on:
         description: "api-key, subscription or openrouter. CI should use api-key: a subscription token is a person's own credential and bills to them. openrouter is a Preview: the same CLI, skills and sub-agents run on a non-Claude model, such as an OpenAI one, through OpenRouter's Anthropic-compatible endpoint, billed to OPENROUTER_API_KEY or to a provider key attached to that OpenRouter account (BYOK). It needs `model` set to an OpenRouter id such as openai/gpt-6.2-sol, and every model slot is pinned to it. Review quality on non-Claude models has not been measured to the bar Claude is held to, the CLI's cost figure is not a real cost on this path, and the diff goes to OpenRouter and to the model's provider, so both must be acceptable processors of this repository's code."
         type: string
         default: api-key
+      engine:
+        description: "claude or codex. codex is a Preview: the same review (stacks, candidate inventory, rule skills, one sub-agent per stack, the same findings, verdict and gate) runs on OpenAI's Codex CLI in a read-only sandbox with no network for its commands and no GitHub token. Review quality on Codex has not been measured to the bar Claude is held to, so read its verdict as advisory until it has been. The diff goes to OpenAI, which must be an acceptable processor of this repository's code. claude-credential and model apply to claude only."
+        type: string
+        default: claude
+      codex-credential:
+        description: "With `engine: codex`: api-key (OPENAI_API_KEY) or chatgpt (the ChatGPT login uploaded to the Checkmate console, lent to one review job at a time through checkmate-url; private and internal repositories only)."
+        type: string
+        default: api-key
+      codex-model:
+        description: "With `engine: codex`: the orchestrator's model. Empty uses config/codex.json in the reviewer, which also pins the two sub-agent models."
+        type: string
+        default: ""
       reviewer-ref:
         description: "Ref of the reviewer repo to check out for the run. Defaults to the caller's own ref so a pinned caller stays pinned end to end; @main here would have quietly un-pinned it."
         type: string
@@ -117,6 +129,9 @@ on:
       OPENROUTER_API_KEY:
         description: "Only with `claude-credential: openrouter`. Set per repo, like ANTHROPIC_API_KEY, and give the key a credit limit on OpenRouter."
         required: false
+      OPENAI_API_KEY:
+        description: "Only with `engine: codex` and `codex-credential: api-key`. Set per repo, like ANTHROPIC_API_KEY, and give the key's project a budget on platform.openai.com. It reaches the Codex step and nothing else."
+        required: false
       LINDAMAR_SLACK_BOT_TOKEN:
         description: "Bot token with chat:write. Preferred over the webhook: a webhook's messages belong to the webhook, so nothing can later edit or delete them — proven by chat.delete returning cant_delete_message on them while the same token deletes its own posts fine. With a bot token the run posts once and edits that message into the result, instead of leaving two."
         required: false
@@ -158,6 +173,11 @@ concurrency:
 # disagree or while any install site is unpinned.
 env:
   LINDAMAR_CLAUDE_CLI_VERSION: "2.1.296"
+  # The Codex CLI, pinned the same way, for `engine: codex` only. 0.170.0 is
+  # the version whose event stream, error wording, sandbox and sub-agent roles
+  # scripts/fixtures/codex was recorded from. scripts/test-cli-pin.sh fails
+  # while any install site is unpinned.
+  LINDAMAR_CODEX_CLI_VERSION: "0.170.0"
 
 jobs:
   # THE AGENT JOB HOLDS NOTHING THAT CAN WRITE (sec-104).
@@ -196,13 +216,15 @@ jobs:
       scope_from: ${{ steps.triage.outputs.scope_from }}
       scope_total: ${{ steps.triage.outputs.scope_total }}
       already: ${{ steps.already.outputs.skip }}
-      ran: ${{ steps.review.outputs.ran }}
-      blocked: ${{ steps.reserve.outputs.blocked || steps.review.outputs.blocked }}
-      reset_at: ${{ steps.reserve.outputs.resetAt || steps.review.outputs.resetAt }}
-      limit: ${{ steps.reserve.outputs.limit || steps.review.outputs.limit }}
+      # One of the two Review steps runs, by `engine`; the other is skipped and
+      # has no outputs, so `||` picks the one that ran.
+      ran: ${{ steps.review.outputs.ran || steps.review_codex.outputs.ran }}
+      blocked: ${{ steps.reserve.outputs.blocked || steps.review.outputs.blocked || steps.review_codex.outputs.blocked }}
+      reset_at: ${{ steps.reserve.outputs.resetAt || steps.review.outputs.resetAt || steps.review_codex.outputs.resetAt }}
+      limit: ${{ steps.reserve.outputs.limit || steps.review.outputs.limit || steps.review_codex.outputs.limit }}
       failed_step: ${{ steps.failed.outputs.step }}
       slack_ts: ${{ steps.slackstart.outputs.ts }}
-      cost: ${{ steps.cost.outputs.cost }}
+      cost: ${{ steps.cost.outputs.cost || steps.cost_codex.outputs.cost }}
       replies: ${{ steps.draft_replies.outputs.count }}
     timeout-minutes: ${{ inputs.timeout-minutes }}
     permissions:
@@ -608,7 +630,35 @@ jobs:
           OAUTH: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           OR_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           MODEL: ${{ inputs.model }}
+          ENGINE: ${{ inputs.engine }}
+          CODEX_CRED: ${{ inputs.codex-credential }}
+          OPENAI_KEY: ${{ inputs.engine == 'codex' && secrets.OPENAI_API_KEY || '' }}
         run: |
+          # engine: codex has its own credentials, and the Claude ones are not
+          # read on that path.
+          case "${ENGINE:-claude}" in
+            claude) ;;
+            codex)
+              case "$CODEX_CRED" in
+                api-key)
+                  if [ -z "$OPENAI_KEY" ]; then
+                    echo "::error title=Missing OPENAI_API_KEY::engine is 'codex' with codex-credential 'api-key', but no OPENAI_API_KEY reached this workflow. Add it in Settings → Secrets and variables → Actions, and pass it in the caller's secrets."
+                    exit 1
+                  fi ;;
+                chatgpt)
+                  # Borrowed from the Checkmate console by the lease step,
+                  # which says why when it cannot be.
+                  echo "::warning title=ChatGPT login in CI::codex-credential 'chatgpt' runs this review on the tenant's ChatGPT plan, lent to one job at a time. OpenAI allows that for private automation only; api-key with a budget is the right credential for CI." ;;
+                *)
+                  echo "::error title=Unknown Codex credential::codex-credential must be 'api-key' or 'chatgpt', got '$CODEX_CRED'."
+                  exit 1 ;;
+              esac
+              echo "::warning title=The Codex engine is a Preview::This review runs on OpenAI's Codex CLI. Review quality on Codex has not been measured to the bar Claude is held to, so read its verdict as advisory until it has been."
+              exit 0 ;;
+            *)
+              echo "::error title=Unknown engine::engine must be 'claude' or 'codex', got '$ENGINE'."
+              exit 1 ;;
+          esac
           case "$CRED" in
             api-key)
               if [ -z "$API_KEY" ]; then
@@ -845,10 +895,59 @@ jobs:
 
       - name: Install the Claude CLI
         id: cli
-        if: steps.already.outputs.skip != 'true' && steps.triage.outputs.skip == ''
+        if: steps.already.outputs.skip != 'true' && steps.triage.outputs.skip == '' && inputs.engine != 'codex'
         run: |
           npm install -g "@anthropic-ai/claude-code@${LINDAMAR_CLAUDE_CLI_VERSION}"
           claude --version
+
+      # engine: codex. Codex confines every command its agent runs to a
+      # sandbox: on Linux, bubblewrap or its bundled helper, which needs
+      # unprivileged user namespaces. Ubuntu 24.04 restricts those through
+      # AppArmor, and OpenAI's documented fix is the bwrap-userns-restrict
+      # profile (learn.chatgpt.com/docs/sandboxing). Then the sandbox is
+      # PROVED before any credential is near it: a command run in it must be
+      # able to read and must fail to write and to reach the network, or the
+      # review does not run. An unconfined agent over diff text anyone can
+      # write is the thing this whole job is built not to have.
+      - name: Install the Codex CLI, and prove its sandbox
+        id: codex_cli
+        if: steps.already.outputs.skip != 'true' && steps.triage.outputs.skip == '' && inputs.engine == 'codex'
+        run: |
+          set -euo pipefail
+          npm install -g "@openai/codex@${LINDAMAR_CODEX_CLI_VERSION}"
+          codex --version
+          if [ "$(uname -s)" = Linux ] && command -v sudo >/dev/null 2>&1; then
+            { sudo apt-get install -y -qq bubblewrap apparmor-profiles >/dev/null 2>&1 \
+                || { sudo apt-get update -qq >/dev/null 2>&1 && sudo apt-get install -y -qq bubblewrap apparmor-profiles >/dev/null 2>&1; }; } \
+              || echo "  could not install bubblewrap; Codex uses its bundled helper"
+            p=/usr/share/apparmor/extra-profiles/bwrap-userns-restrict
+            if [ -f "$p" ] && command -v apparmor_parser >/dev/null 2>&1; then
+              sudo install -m 0644 "$p" /etc/apparmor.d/bwrap-userns-restrict \
+                && sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict \
+                || echo "  could not load the bwrap AppArmor profile"
+            fi
+          fi
+          probe="$RUNNER_TEMP/codex-probe"; rm -rf "$probe"; mkdir -p "$probe/home"
+          echo readable > "$probe/f"
+          cat > "$probe/probe.sh" <<'EOF'
+          cat f >/dev/null 2>&1 && echo PROBE_READ
+          (echo x > f2) 2>/dev/null && echo PROBE_WROTE
+          curl -sS -m 8 -o /dev/null https://api.github.com 2>/dev/null && echo PROBE_NET
+          exit 0
+          EOF
+          out="$(cd "$probe" && env -i PATH="$PATH" HOME="$probe/home" CODEX_HOME="$probe/home" \
+                   codex sandbox -c 'sandbox_mode="read-only"' -- sh probe.sh 2>&1)" || true
+          printf '%s\n' "$out" | sed 's/^/  sandbox probe: /'
+          rm -rf "$probe"
+          case "$out" in
+            *PROBE_WROTE*|*PROBE_NET*)
+              echo "::error title=The Codex sandbox does not hold on this runner::A command in Codex's read-only sandbox could write a file or reach the network, so the review will not run here. Use a runner that allows unprivileged user namespaces (or the bwrap AppArmor profile), or engine: claude."
+              exit 1 ;;
+            *PROBE_READ*) echo "  the read-only sandbox holds: reads work, writes and the network are refused" ;;
+            *)
+              echo "::error title=The Codex sandbox could not start on this runner::A command could not run in Codex's read-only sandbox (output above), so the review will not run unconfined. Use a runner that allows unprivileged user namespaces (or the bwrap AppArmor profile), or engine: claude."
+              exit 1 ;;
+          esac
 
       # Off unless the caller sets usage-reserve-percent. The CLI reports how
       # much of each subscription window is used in the `rate_limit_event` of
@@ -858,7 +957,7 @@ jobs:
       # and a `limit` the gate names. Anything unreadable starts the review.
       - name: Keep the usage reserve free
         id: reserve
-        if: steps.already.outputs.skip != 'true' && steps.triage.outputs.skip == '' && inputs.usage-reserve-percent > 0 && inputs.claude-credential == 'subscription'
+        if: steps.already.outputs.skip != 'true' && steps.triage.outputs.skip == '' && inputs.usage-reserve-percent > 0 && inputs.claude-credential == 'subscription' && inputs.engine != 'codex'
         env:
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           RESERVE: ${{ inputs.usage-reserve-percent }}
@@ -942,7 +1041,7 @@ jobs:
           fi
 
       - name: Review
-        if: steps.already.outputs.skip != 'true' && steps.triage.outputs.skip == '' && steps.reserve.outputs.blocked == ''
+        if: steps.already.outputs.skip != 'true' && steps.triage.outputs.skip == '' && steps.reserve.outputs.blocked == '' && inputs.engine != 'codex'
         id: review
         working-directory: .lindamar-reviewer
         env:
@@ -1127,10 +1226,131 @@ jobs:
           fi
           echo "ran=true" >> "$GITHUB_OUTPUT"
 
+      # engine: codex, step 1 of 2. Everything the review skill does before it
+      # launches sub-agents, with this job's read token and no model
+      # credential: stacks, the previous round, the scope, the candidate
+      # inventory, one packet per stack and aspect, and the diff and head
+      # content of every changed file. The model step after it then needs no
+      # GitHub token and no network for its commands (scripts/codex-review.sh).
+      - name: Prepare the Codex review
+        id: codex_prep
+        if: steps.already.outputs.skip != 'true' && steps.triage.outputs.skip == '' && inputs.engine == 'codex'
+        working-directory: .lindamar-reviewer
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ steps.pr.outputs.number }}
+          LINDAMAR_SCOPE: ${{ steps.triage.outputs.scope }}
+          LINDAMAR_SCOPE_FROM: ${{ steps.triage.outputs.scope_from }}
+          CODEX_MODEL: ${{ inputs.codex-model }}
+        run: |
+          set -uo pipefail
+          mkdir -p "$RUNNER_TEMP/state"
+          export LINDAMAR_STATE_DIR="$RUNNER_TEMP/state"
+          rc=0
+          bash scripts/codex-review.sh prepare --repo "$REPO" --pr "$PR" --work "$RUNNER_TEMP/codex-work" || rc=$?
+          [ "$rc" -ne 0 ] || bash scripts/codex-review.sh home --work "$RUNNER_TEMP/codex-work" \
+            --home "$RUNNER_TEMP/codex-home" ${CODEX_MODEL:+--model "$CODEX_MODEL"} || rc=$?
+          if [ "$rc" -ne 0 ]; then
+            echo "::error title=The Codex review could not be prepared::Its reason is above. No model ran and nothing was spent."
+            exit "$rc"
+          fi
+
+      # codex-credential: chatgpt. The tenant's ChatGPT login, borrowed from
+      # Checkmate for this job alone (lindamar-reviewer-platform,
+      # docs/pipeline-config.md, "The ChatGPT login lease"): an OIDC token
+      # exchanged for the auth.json, written to CODEX_HOME with mode 600. A
+      # login another job holds is waited for, up to ten minutes. Its own step,
+      # because the review step has no OIDC request variables.
+      - name: Borrow the ChatGPT login from Checkmate
+        id: codex_lease
+        if: steps.already.outputs.skip != 'true' && steps.triage.outputs.skip == '' && inputs.engine == 'codex' && inputs.codex-credential == 'chatgpt'
+        working-directory: .lindamar-reviewer
+        env:
+          CHECKMATE_URL: ${{ inputs.checkmate-url }}
+          TIMEOUT: ${{ inputs.timeout-minutes }}
+        run: |
+          set -uo pipefail
+          out="$(bash scripts/codex-login.sh lease --url "$CHECKMATE_URL" --home "$RUNNER_TEMP/codex-home" \
+                   --job agent --timeout-minutes "$TIMEOUT" --wait-seconds 600)" || exit 1
+          id="$(printf '%s\n' "$out" | sed -n 's/^lease_id=//p' | head -1)"
+          [ -n "$id" ] || { echo "::error title=No ChatGPT lease::Checkmate lent the login without a lease id."; exit 1; }
+          echo "lease_id=$id" >> "$GITHUB_OUTPUT"
+
+      # engine: codex, step 2 of 2. Codex in a read-only sandbox (proved above)
+      # with approval never, no web search, no AGENTS.md, and an environment
+      # rebuilt from nothing: PATH, an empty HOME, CODEX_HOME and the model
+      # credential. No GitHub token is in this step at all. Its final answer
+      # must match codex/review-output.schema.json; handoff then writes the
+      # same files the Claude path hands over, and the post job takes them
+      # exactly as it takes Claude's.
+      - name: Review with Codex
+        id: review_codex
+        if: steps.already.outputs.skip != 'true' && steps.triage.outputs.skip == '' && inputs.engine == 'codex'
+        working-directory: .lindamar-reviewer
+        env:
+          CODEX_API_KEY: ${{ inputs.engine == 'codex' && inputs.codex-credential == 'api-key' && secrets.OPENAI_API_KEY || '' }}
+          LINDAMAR_HANDOFF_DIR: ${{ runner.temp }}/handoff
+        run: |
+          set -uo pipefail
+          O="$RUNNER_TEMP/codex-out"
+          rc=0
+          # The runner's file commands are not the agent's: run builds its
+          # environment with env -i, and this removes them from the shell too.
+          env -u GITHUB_OUTPUT -u GITHUB_ENV -u GITHUB_PATH -u GITHUB_STEP_SUMMARY -u GITHUB_STATE \
+            -u ACTIONS_ID_TOKEN_REQUEST_URL -u ACTIONS_ID_TOKEN_REQUEST_TOKEN \
+          bash scripts/codex-review.sh run --work "$RUNNER_TEMP/codex-work" --home "$RUNNER_TEMP/codex-home" --out "$O" || rc=$?
+          unset CODEX_API_KEY
+          # Where the Claude path keeps its transcript, so upload-transcript
+          # and the cost step find it.
+          cp "$O/stream.jsonl" "$RUNNER_TEMP/stream.jsonl" 2>/dev/null || : > "$RUNNER_TEMP/stream.jsonl"
+          cp "$O/stream.err" "$RUNNER_TEMP/stream.err" 2>/dev/null || : > "$RUNNER_TEMP/stream.err"
+          jq -R -r 'fromjson? | select(.type == "item.completed" and .item.type == "agent_message") | .item.text' \
+            "$RUNNER_TEMP/stream.jsonl" 2>/dev/null | tail -c 4000 || true
+          if [ -s "$RUNNER_TEMP/stream.err" ]; then
+            echo "--- stderr from Codex ---"; tail -c 2000 "$RUNNER_TEMP/stream.err"
+          fi
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          [ "$rc" -ne 97 ] || { echo "::error title=The answer held a credential, nothing was posted::The Codex answer contained the model credential, which is what a prompt injection in the diff would aim for. It was discarded. Read the diff for text addressed to an AI reviewer."; exit 1; }
+          # A run that exited 0 and handed nothing over reviewed nothing the
+          # post job can use, so it is classified like a failed exit.
+          nohandoff=""
+          if [ "$rc" -eq 0 ]; then
+            rm -rf "$LINDAMAR_HANDOFF_DIR"
+            bash scripts/codex-review.sh handoff --work "$RUNNER_TEMP/codex-work" --result "$O/last.json" \
+              --out "$LINDAMAR_HANDOFF_DIR" || { nohandoff="a valid final answer"; rc=1; }
+          fi
+          if [ "$rc" -ne 0 ]; then
+            # From the run's own events, never from the review's prose
+            # (scripts/codex-stream.sh classify, on recorded 0.170.0 output).
+            c="$(bash scripts/codex-stream.sh classify --stream "$RUNNER_TEMP/stream.jsonl" --err "$RUNNER_TEMP/stream.err" 2>/dev/null || true)"
+            get() { printf '%s\n' "$c" | sed -n "s/^$1=//p" | head -1; }
+            blocked="$(get blocked)"; limit="$(get limit)"; reset="$(get resetAt)"; reason="$(get reason)"
+            if [ -z "$blocked" ] && [ "$(get worked)" != true ]; then blocked=nowork; fi
+            if [ -n "$nohandoff" ] && [ "$blocked" != usage ] && [ "$blocked" != auth ]; then blocked=""; fi
+            printf '%s' "$reset" | grep -Eq '^[A-Za-z0-9:,/()_+. -]{1,48}$' || reset=""
+            echo "blocked=$blocked" >> "$GITHUB_OUTPUT"
+            [ "$blocked" != usage ] || echo "limit=$limit" >> "$GITHUB_OUTPUT"
+            [ "$blocked" != usage ] || [ -z "$reset" ] || echo "resetAt=$reset" >> "$GITHUB_OUTPUT"
+            [ -z "$reason" ] || echo "  Codex said: $reason"
+            case "$blocked" in
+              usage) echo "::error title=OpenAI usage limit reached ($limit), nothing was reviewed::The reviewer's OpenAI credential is out of usage${reset:+ until $reset}, so this pull request was not checked. This is not a finding and nothing here is the author's to fix. The required check says what to do." ;;
+              auth)  echo "::error title=Credential rejected, nothing was reviewed::OpenAI refused the reviewer's credential. This pull request was not checked, and retrying will not help until the secret or the login is replaced." ;;
+              nowork) echo "::error title=The reviewer did no work::Codex started and stopped without a command, a sub-agent or an output token, so it never got as far as reading the diff. Its stderr and events are above." ;;
+              *) if [ -n "$nohandoff" ]; then
+                   echo "::error title=The agent handed nothing over::Codex exited 0 without $nohandoff, so there is no review to post."
+                 else
+                   echo "::error title=The reviewer exited $rc::Codex ran and failed. Its stderr and events are above. Nothing was posted, so the gate is red for that reason and not for a finding."
+                 fi ;;
+            esac
+            exit "$rc"
+          fi
+          echo "ran=true" >> "$GITHUB_OUTPUT"
+
       # The review, as data, for the post job. Retention is a day: it quotes
       # findings about this repository's code and nothing needs it afterwards.
       - uses: actions/upload-artifact@v4
-        if: steps.review.outputs.ran == 'true'
+        if: steps.review.outputs.ran == 'true' || steps.review_codex.outputs.ran == 'true'
         with:
           name: lindamar-review-handoff-${{ steps.pr.outputs.number }}
           path: ${{ runner.temp }}/handoff
@@ -1159,7 +1379,7 @@ jobs:
       # time, so a reply waits for the next round that runs the model.
       - name: Find the threads a person is waiting on
         id: collect_replies
-        if: steps.review.outputs.ran == 'true'
+        if: steps.review.outputs.ran == 'true' || steps.review_codex.outputs.ran == 'true'
         continue-on-error: true
         # A step's own timeout ends only the step, which continue-on-error
         # then forgives; the job's would fail the run and with it the gate.
@@ -1196,14 +1416,31 @@ jobs:
         timeout-minutes: 5
         working-directory: .lindamar-reviewer
         env:
-          ANTHROPIC_API_KEY: ${{ inputs.claude-credential == 'api-key' && secrets.ANTHROPIC_API_KEY || '' }}
-          CLAUDE_CODE_OAUTH_TOKEN: ${{ inputs.claude-credential == 'subscription' && secrets.CLAUDE_CODE_OAUTH_TOKEN || '' }}
+          ANTHROPIC_API_KEY: ${{ inputs.engine != 'codex' && inputs.claude-credential == 'api-key' && secrets.ANTHROPIC_API_KEY || '' }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ inputs.engine != 'codex' && inputs.claude-credential == 'subscription' && secrets.CLAUDE_CODE_OAUTH_TOKEN || '' }}
           LINDAMAR_REPLY_MODEL: sonnet
           LINDAMAR_MODEL: ${{ inputs.model }}
           LINDAMAR_CREDENTIAL: ${{ inputs.claude-credential }}
-          LINDAMAR_OPENROUTER_KEY: ${{ inputs.claude-credential == 'openrouter' && secrets.OPENROUTER_API_KEY || '' }}
+          LINDAMAR_OPENROUTER_KEY: ${{ inputs.engine != 'codex' && inputs.claude-credential == 'openrouter' && secrets.OPENROUTER_API_KEY || '' }}
+          LINDAMAR_ENGINE: ${{ inputs.engine }}
+          CODEX_API_KEY: ${{ inputs.engine == 'codex' && inputs.codex-credential == 'api-key' && secrets.OPENAI_API_KEY || '' }}
         run: |
           set -uo pipefail
+          # engine: codex drafts with Codex (scripts/thread-replies.sh): no
+          # tools at all, the fast model, the same fenced prompt. With a
+          # leased ChatGPT login it reuses the review's CODEX_HOME, whose
+          # auth.json is still this job's until the return step.
+          if [ "${LINDAMAR_ENGINE:-claude}" = codex ]; then
+            unset LINDAMAR_CREDENTIAL LINDAMAR_OPENROUTER_KEY
+            [ -n "${CODEX_API_KEY:-}" ] || export LINDAMAR_CODEX_HOME="$RUNNER_TEMP/codex-home"
+            env -u GITHUB_OUTPUT -u GITHUB_ENV -u GITHUB_PATH -u GITHUB_STATE \
+              -u ACTIONS_ID_TOKEN_REQUEST_URL -u ACTIONS_ID_TOKEN_REQUEST_TOKEN \
+            bash scripts/thread-replies.sh draft --in "$RUNNER_TEMP/replies/threads.json" \
+              --out "$RUNNER_TEMP/replies/replies.json" --max 5
+            echo "count=$(jq 'length' "$RUNNER_TEMP/replies/replies.json" 2>/dev/null || echo 0)" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          unset CODEX_API_KEY LINDAMAR_ENGINE
           # claude-credential: openrouter (Preview). Every model slot is pinned
           # to the one model: with only --model set, sub-agents and the CLI's
           # background calls ran on Claude through the OpenRouter key, at
@@ -1261,7 +1498,7 @@ jobs:
 
       - name: Record what it cost
         id: cost
-        if: always() && steps.triage.outputs.skip == ''
+        if: always() && steps.triage.outputs.skip == '' && inputs.engine != 'codex'
         env:
           REPO: ${{ github.repository }}
           PR: ${{ steps.pr.outputs.number }}
@@ -1306,6 +1543,76 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           # For the Slack line, which the post job writes.
           echo "cost=$(jq -r 'if .costUsd then "$" + ((.costUsd*100|round/100)|tostring) elif .credential == "openrouter" then "billed by OpenRouter" else "not recorded" end' "$RUNNER_TEMP/cost.json" 2>/dev/null || echo "not recorded")" >> "$GITHUB_OUTPUT"
+
+      # The login goes back whatever happened, with a fresh OIDC token: the
+      # file as Codex left it, refreshed or not. `unused` if Codex never ran,
+      # `auth_failed` if OpenAI refused it (nothing is lent then until an admin
+      # uploads a new one), `lost` if there is nothing valid to give back.
+      # Then the file is deleted.
+      - name: Give the ChatGPT login back to Checkmate
+        if: always() && steps.codex_lease.outputs.lease_id != ''
+        continue-on-error: true
+        working-directory: .lindamar-reviewer
+        env:
+          CHECKMATE_URL: ${{ inputs.checkmate-url }}
+          LEASE: ${{ steps.codex_lease.outputs.lease_id }}
+          REVIEWED: ${{ steps.review_codex.outcome }}
+          BLOCKED: ${{ steps.review_codex.outputs.blocked }}
+        run: |
+          set -uo pipefail
+          outcome=ran
+          [ "${REVIEWED:-skipped}" != skipped ] || outcome=unused
+          [ "${BLOCKED:-}" != auth ] || outcome=auth_failed
+          bash scripts/codex-login.sh return --url "$CHECKMATE_URL" --home "$RUNNER_TEMP/codex-home" \
+            --lease "$LEASE" --outcome "$outcome" || true
+          rm -f "$RUNNER_TEMP/codex-home/auth.json"
+
+      # engine: codex. Codex reports tokens and no dollars, so the figure is
+      # computed from the token counts and the pinned price table in the
+      # reviewer's config/codex.json, and the summary says so. The tokens come
+      # from Codex's session files, which hold every thread's per-request
+      # usage; its JSON stream counts the root agent only (measured on
+      # 0.170.0). On a ChatGPT login nothing is billed per token: the figure
+      # is what the API would have charged, labelled as that. Then the session
+      # files go, because they quote the diff.
+      - name: Record what the Codex review cost
+        id: cost_codex
+        if: always() && steps.triage.outputs.skip == '' && inputs.engine == 'codex'
+        env:
+          REPO: ${{ github.repository }}
+          PR: ${{ steps.pr.outputs.number }}
+          SHA: ${{ steps.pr.outputs.sha }}
+          CRED: ${{ inputs.codex-credential }}
+        run: |
+          set -uo pipefail
+          S="$RUNNER_TEMP/stream.jsonl"; X="$GITHUB_WORKSPACE/.lindamar-reviewer/scripts/codex-stream.sh"
+          if [ ! -s "$S" ] || [ ! -f "$X" ]; then
+            echo "no stream to cost"
+            rm -rf "$RUNNER_TEMP/codex-home/sessions" "$RUNNER_TEMP/codex-work"
+            exit 0
+          fi
+          model="$(jq -r '.model // empty' "$RUNNER_TEMP/codex-work/input/engine.json" 2>/dev/null || true)"
+          bash "$X" cost --stream "$S" --home "$RUNNER_TEMP/codex-home" --model "${model:-?}" > "$RUNNER_TEMP/codex-cost.json" 2>/dev/null \
+            || echo '{}' > "$RUNNER_TEMP/codex-cost.json"
+          rm -rf "$RUNNER_TEMP/codex-home/sessions" "$RUNNER_TEMP/codex-work"
+          jq -c --arg repo "$REPO" --arg pr "$PR" --arg sha "$SHA" --arg cred "$CRED" '
+            { repo: $repo, pr: ($pr | tonumber? // null), sha: $sha, engine: "codex", credential: $cred,
+              complete: (.complete // false),
+              costUsd: (if $cred == "api-key" then .costUsd else null end),
+              apiEquivalentUsd: (if $cred == "api-key" then null else .costUsd end),
+              costBasis: "computed from tokens: config/codex.json prices as of \(.priceAsOf // "?")",
+              outputTokens: (.tokens.output // null), tokens: .tokens, byModel: .byModel,
+              subagents: .subagents, turns: .turns, tokenSource: .source,
+              models: [ (.byModel // [])[].model ],
+              note: .note }' "$RUNNER_TEMP/codex-cost.json" > "$RUNNER_TEMP/cost.json" || echo '{}' > "$RUNNER_TEMP/cost.json"
+          cat "$RUNNER_TEMP/cost.json"
+          {
+            echo "### Review cost"
+            echo ""
+            jq -r '"- repo: `\(.repo)` PR #\(.pr)\n- engine: Codex (Preview), credential: `\(.credential)`\n- cost: \(if .costUsd != null then "$" + (.costUsd|tostring) + ", **computed** from token counts and the price table in config/codex.json; Codex reports no dollar figure" elif .apiEquivalentUsd != null then "billed to the ChatGPT plan, not per token; at API prices it would have been $" + (.apiEquivalentUsd|tostring) else "not computed — " + (.note // "no usage was recorded") end)\n- tokens: \(.tokens.input // "?") in (\(.tokens.cachedInput // "?") cached), \(.outputTokens // "?") out, from the \(.tokenSource // "?")\n- agents: \(.subagents // "?")  turns: \(.turns // "?")\n- note: \(.note // "none")"' \
+              "$RUNNER_TEMP/cost.json"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "cost=$(jq -r 'if .costUsd != null then "$" + ((.costUsd*100|round/100)|tostring) + " (computed)" elif .apiEquivalentUsd != null then "ChatGPT plan" else "not recorded" end' "$RUNNER_TEMP/cost.json" 2>/dev/null || echo "not recorded")" >> "$GITHUB_OUTPUT"
 
       # The raw transcript is NOT uploaded. It quotes the diff, so in a client
       # repo it is that client's source, and a review that finds a committed
@@ -1353,6 +1660,9 @@ jobs:
           O_SKILLS: ${{ steps.skills.outcome }}
           O_CLI: ${{ steps.cli.outcome }}
           O_REVIEW: ${{ steps.review.outcome }}
+          O_CODEX_CLI: ${{ steps.codex_cli.outcome }}
+          O_CODEX_PREP: ${{ steps.codex_prep.outcome }}
+          O_REVIEW_CODEX: ${{ steps.review_codex.outcome }}
         run: |
           set -uo pipefail
           for p in "Work out which pull request this is=${O_PR:-}" \
@@ -1363,7 +1673,10 @@ jobs:
                    "Check out the reviewer=${O_CHECKOUT:-}" \
                    "Install the reviewer's skills, and verify the count=${O_SKILLS:-}" \
                    "Install the Claude CLI=${O_CLI:-}" \
-                   "Review=${O_REVIEW:-}"; do
+                   "Review=${O_REVIEW:-}" \
+                   "Install the Codex CLI, and prove its sandbox=${O_CODEX_CLI:-}" \
+                   "Prepare the Codex review=${O_CODEX_PREP:-}" \
+                   "Review with Codex=${O_REVIEW_CODEX:-}"; do
             if [ "${p##*=}" = failure ]; then echo "step=${p%=*}" >> "$GITHUB_OUTPUT"; echo "  first failed: ${p%=*}"; break; fi
           done
 
@@ -1659,6 +1972,7 @@ jobs:
           BLOCKED: ${{ needs.agent.outputs.blocked }}
           LIMIT: ${{ needs.agent.outputs.limit }}
           RESET_AT: ${{ needs.agent.outputs.reset_at }}
+          ENGINE: ${{ inputs.engine }}
         run: |
           # Read the verdict from GitHub, not from the transcript. A run can print
           # a confident summary and never have posted anything — that happened
@@ -1688,6 +2002,20 @@ jobs:
           # a limit. Both values are checked, not trusted.
           if [ "${BLOCKED:-}" = usage ] && [ "${REVIEW_RAN:-}" != "true" ]; then
             printf '%s' "${RESET_AT:-}" | grep -Eq '^[A-Za-z0-9:,/()_+. -]{1,48}$' || RESET_AT=""
+            # engine: codex names OpenAI's limits, which are not Claude's.
+            if [ "${ENGINE:-claude}" = codex ]; then
+              case "${LIMIT:-}" in
+                plan)     title="ChatGPT plan usage limit reached"; what="the usage limit of the ChatGPT plan whose login it borrows" ;;
+                credit)   title="OpenAI quota exhausted";           what="the quota or credit of its OpenAI API key's project" ;;
+                api-rate) title="OpenAI API rate limit reached";    what="the OpenAI API rate limit" ;;
+                *)        title="OpenAI usage limit reached";       what="an OpenAI usage limit Codex did not name" ;;
+              esac
+              msg="The review did not run: the reviewer's OpenAI credential hit $what${RESET_AT:+, which resets $RESET_AT}. This red check is not a verdict on the code, and nothing here is the author's to fix. Wait${RESET_AT:+ until it resets} and re-run this job (the automatic retry also tries again), or switch the reviewer to another credential in the Checkmate console."
+              echo "::error title=$title, nothing was reviewed::$msg"
+              { echo "### $title, nothing was reviewed"; echo ""; echo "$msg"; } >> "$GITHUB_STEP_SUMMARY"
+              { echo "limit_title=$title"; echo "limit_msg=$msg"; echo "limit_reset=$RESET_AT"; } >> "$GITHUB_OUTPUT"
+              exit 1
+            fi
             case "${LIMIT:-}" in
               session)  title="Claude 5-hour limit reached";      what="its Claude subscription's 5-hour session limit" ;;
               weekly)   title="Claude weekly limit reached";      what="its Claude subscription's weekly limit" ;;
@@ -1879,6 +2207,7 @@ jobs:
           BLOCKED: ${{ needs.agent.outputs.blocked }}
           RESET_AT: ${{ needs.agent.outputs.reset_at }}
           LIMIT_MSG: ${{ steps.gate.outputs.limit_msg }}
+          ENGINE: ${{ inputs.engine }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -uo pipefail
@@ -1895,6 +2224,7 @@ jobs:
           case "$BLOCKED" in
             usage)
               headline="**The reviewer hit a Claude usage limit, so this pull request was not checked.**"
+              [ "${ENGINE:-claude}" != codex ] || headline="**The reviewer hit an OpenAI usage limit, so this pull request was not checked.**"
               # The gate's sentence, composed from the checked values: which
               # limit, when it resets, and what to do.
               detail="Nothing here is yours to fix. It retries on its own${RESET_AT:+, and the credential resets around \`$RESET_AT\`}. The check stays red until a review actually runs, because an unreviewed commit is not a passing one."

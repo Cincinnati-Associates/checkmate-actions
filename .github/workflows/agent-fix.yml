@@ -77,6 +77,10 @@ on:
       model:
         type: string
         default: claude-opus-5
+      engine:
+        description: "claude only. The agent fix edits files and opens a pull request, so it runs on Claude Code alone for now; codex is refused before anything runs. The review's `engine: codex` is separate."
+        type: string
+        default: claude
       timeout-minutes:
         type: number
         default: 30
@@ -123,8 +127,19 @@ jobs:
         id: which
         env:
           TASK: ${{ inputs.task }}
+          ENGINE: ${{ inputs.engine }}
         run: |
           set -euo pipefail
+          # First, before any token is minted or anything is spent.
+          case "${ENGINE:-claude}" in
+            claude) ;;
+            codex)
+              echo "::error title=The agent fix runs on Claude only::engine 'codex' is not supported here yet: the agent fix edits files and opens a pull request, and only its Claude path has been built and measured. The review can run on Codex (review.yml engine: codex); start this fix with engine: claude."
+              exit 1 ;;
+            *)
+              echo "::error title=Unknown engine::engine must be 'claude', got '$ENGINE'."
+              exit 1 ;;
+          esac
           # The authored rule skills the review always loads (not lindamar-review-pr,
           # the orchestrator), and the stack skills for the ecosystem the task names.
           authored="lindamar-review-base lindamar-review-supply-chain lindamar-review-security lindamar-review-shell lindamar-review-sql"
