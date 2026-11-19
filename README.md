@@ -106,6 +106,27 @@ With 20, a review does not start once either window is 80% used or more. The req
 
 Only the review uses this credential. Agent fixes still need a Claude credential.
 
+### OpenAI's Codex CLI as the engine (Preview)
+
+`engine: codex` runs the same review (stacks, candidate inventory, rule skills, one sub-agent per stack, findings, verdict and gate) on OpenAI's Codex CLI instead of Claude Code. With an API key:
+
+```yaml
+    secrets:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+    with:
+      engine: codex
+```
+
+With the ChatGPT login uploaded to the Checkmate console (AI providers → ChatGPT), lent to one review job at a time: `codex-credential: chatgpt`, and no key. Private and internal repositories only.
+
+- Codex runs in a read-only sandbox, with no network for its commands and no GitHub token in the step. The job proves the sandbox on the runner first and does not review if it does not hold.
+- Codex reports tokens, not dollars. The cost in the run summary is computed from a pinned price table in the reviewer's `config/codex.json`, and says so. On a ChatGPT login it is what the API would have charged.
+- `codex-model` overrides the orchestrator's model; the two sub-agent models are pinned in the reviewer's config.
+- The diff goes to OpenAI, which must be an acceptable processor of the repository's code.
+- Review quality on Codex has not been measured to the bar Claude is held to. Read the verdict as advisory until it has been.
+
+Agent fixes run on Claude only; `engine: codex` is refused there.
+
 ### Runner
 
 Every job runs on `ubuntu-latest`, which uses the calling organisation's GitHub Actions minutes. To use other runners, set the `LINDAMAR_RUNNER` Actions variable on the calling repository or organisation:
