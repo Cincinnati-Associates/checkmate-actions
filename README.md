@@ -125,6 +125,21 @@ With the ChatGPT login uploaded to the Checkmate console (AI providers → ChatG
 - The diff goes to OpenAI, which must be an acceptable processor of the repository's code.
 - Review quality on Codex has not been measured to the bar Claude is held to. Read the verdict as advisory until it has been.
 
+#### When the ChatGPT login cannot be used: `codex-fallback`
+
+One login is lent to one job at a time, so on a busy repository another job often holds it. With `codex-credential: chatgpt`, `codex-fallback: claude` (the default) reviews on Claude instead of failing the check, exactly as `engine: claude` would, with `claude-credential` and its secret (pass `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN` as for a Claude review). `codex-fallback: none` fails the check, as before.
+
+| What happened | `codex-fallback: claude` with a Claude credential | `none`, or no Claude credential |
+|---|---|---|
+| Lease granted | Codex reviews | Codex reviews |
+| Still lent to another job after `codex-lease-wait` minutes (default 2) | Claude reviews | fails after waiting 10 minutes |
+| 404 `login_not_set`, 409 `login_needs_reupload`, 502 `secret_unreadable` | Claude reviews | fails |
+| Checkmate does not answer (no answer, 503 three times, another 5xx) | Claude reviews | fails |
+| OpenAI refuses the login during the Codex review | lease released as `auth_failed`, then Claude reviews | fails, lease released as `auth_failed` |
+| 403 (`public_repository`, `visibility_unknown`, `workflow_not_allowed`, `owner_not_allowed`), 401, 400 | fails: a configuration error | fails |
+
+A fallback is said in a notice, in the job summary (for example "Codex login lent to owner/repo run N until T; reviewed on Claude."), in one line at the end of the review, and in the cost record (`engine: claude`, `requestedEngine: codex`, `fallback: <reason>`). Cost and usage limits are then Claude's. A Claude review after OpenAI refused the login does not run the `usage-reserve-percent` check. An `api-key` credential is not lent, so it never falls back.
+
 Agent fixes run on Claude only; `engine: codex` is refused there.
 
 ### Runner
