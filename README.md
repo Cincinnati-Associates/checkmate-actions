@@ -125,20 +125,27 @@ With the ChatGPT login uploaded to the Checkmate console (AI providers → ChatG
 - The diff goes to OpenAI, which must be an acceptable processor of the repository's code.
 - Review quality on Codex has not been measured to the bar Claude is held to. Read the verdict as advisory until it has been.
 
+#### Waiting in line for the ChatGPT login: `codex-lease-wait`
+
+One login is lent to one job at a time, so on a busy repository another job often holds it. A review that finds it lent waits in line: Checkmate lends it to the review that has waited longest, with one place per pull request, and a newer run of a pull request keeps the place of the run it replaces. A run cancelled by a push gives its place up, and the pull request's place is kept for a few minutes for the new run. `codex-lease-wait` (default 40, at most 60) is how many minutes a review waits in line before it falls back or fails. The job summary says the place in line at the start, how long the review waited, and whether Codex reviewed; the console's ChatGPT page shows the line.
+
+The wait runs on the runner, so it counts as Actions minutes. So that it fits, the agent job's time limit on this path is 120 minutes (240 with a `timeout-minutes` over 60, 360 over 225). The lease is asked for that whole limit less the time waited, so it outlives the job. Only a run started by a pull request event holds its pull request's place; a hand-started retry waits in a place of its own. `timeout-minutes` still limits the review step itself, and the wait is cut short when it would not leave the review its `timeout-minutes`. A Checkmate from before the queue still lends the login: the review asks every 30 seconds, as before.
+
 #### When the ChatGPT login cannot be used: `codex-fallback`
 
-One login is lent to one job at a time, so on a busy repository another job often holds it. With `codex-credential: chatgpt`, `codex-fallback: claude` (the default) reviews on Claude instead of failing the check, exactly as `engine: claude` would, with `claude-credential` and its secret (pass `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN` as for a Claude review). `codex-fallback: none` fails the check, as before.
+With `codex-credential: chatgpt`, `codex-fallback: claude` (the default) reviews on Claude instead of failing the check, exactly as `engine: claude` would, with `claude-credential` and its secret (pass `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN` as for a Claude review). `codex-fallback: none` fails the check, as before.
 
 | What happened | `codex-fallback: claude` with a Claude credential | `none`, or no Claude credential |
 |---|---|---|
 | Lease granted | Codex reviews | Codex reviews |
-| Still lent to another job after `codex-lease-wait` minutes (default 2) | Claude reviews | fails after waiting 10 minutes |
+| Still waiting in line after `codex-lease-wait` minutes (default 40) | Claude reviews | fails, after waiting at least 10 minutes |
+| A newer run of the same pull request took its place in line (409 `queue_superseded`) | Claude reviews | fails |
 | 404 `login_not_set`, 409 `login_needs_reupload`, 502 `secret_unreadable` | Claude reviews | fails |
 | Checkmate does not answer (no answer, 503 three times, another 5xx) | Claude reviews | fails |
 | OpenAI refuses the login during the Codex review | lease released as `auth_failed`, then Claude reviews | fails, lease released as `auth_failed` |
 | 403 (`public_repository`, `visibility_unknown`, `workflow_not_allowed`, `owner_not_allowed`), 401, 400 | fails: a configuration error | fails |
 
-A fallback is said in a notice, in the job summary (for example "Codex login lent to owner/repo run N until T; reviewed on Claude."), in one line at the end of the review, and in the cost record (`engine: claude`, `requestedEngine: codex`, `fallback: <reason>`). Cost and usage limits are then Claude's. A Claude review after OpenAI refused the login does not run the `usage-reserve-percent` check. An `api-key` credential is not lent, so it never falls back.
+A fallback is said in a notice, in the job summary (for example "Codex login lent to owner/repo run N until T; this run was 3 of 5 in line after waiting 40 min; reviewed on Claude."), in one line at the end of the review, and in the cost record (`engine: claude`, `requestedEngine: codex`, `fallback: <reason>`). Cost and usage limits are then Claude's. A Claude review after OpenAI refused the login does not run the `usage-reserve-percent` check. An `api-key` credential is not lent, so it never falls back.
 
 Agent fixes run on Claude only; `engine: codex` is refused there.
 
