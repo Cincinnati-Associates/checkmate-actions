@@ -74,7 +74,7 @@ on:
         type: string
         default: api-key
       engine:
-        description: "claude or codex. codex is a Preview: the same review (stacks, candidate inventory, rule skills, one sub-agent per stack, the same findings, verdict and gate) runs on OpenAI's Codex CLI in a read-only sandbox with no network for its commands and no GitHub token. Review quality on Codex has not been measured to the bar Claude is held to, so read its verdict as advisory until it has been. The diff goes to OpenAI, which must be an acceptable processor of this repository's code. claude-credential and model apply to claude only."
+        description: "claude or codex. codex is a Preview: the same review (stacks, candidate inventory, rule skills, one sub-agent per stack, the same findings, verdict and gate) runs on OpenAI's Codex CLI in a read-only sandbox with no network for its commands and no GitHub token. Review quality on Codex has not been measured to the bar Claude is held to, so read its verdict as advisory until it has been. The diff goes to OpenAI, which must be an acceptable processor of this repository's code. claude-credential and model apply to claude, and to a codex review that falls back to Claude (codex-fallback)."
         type: string
         default: claude
       codex-credential:
@@ -85,6 +85,14 @@ on:
         description: "With `engine: codex`: the orchestrator's model. Empty uses config/codex.json in the reviewer, which also pins the two sub-agent models."
         type: string
         default: ""
+      codex-fallback:
+        description: "With `engine: codex` and `codex-credential: chatgpt`: what reviews when the ChatGPT login cannot be used. claude (the default) reviews on Claude, exactly as `engine: claude` would, with claude-credential and its secret: when the login is still lent to another job after codex-lease-wait, is not set, needs a new upload, cannot be read, when Checkmate does not answer, or when OpenAI refuses the login during the review. The run says so in a notice, the job summary, the review and the cost record. A policy refusal (public repository, workflow or owner not allowed, a token that does not verify) is a configuration error and is never fallen back from, and without a Claude credential nothing falls back. none fails the check instead, as before. An api-key credential is not lent, so it never falls back."
+        type: string
+        default: claude
+      codex-lease-wait:
+        description: "With `codex-credential: chatgpt` and a Claude fallback: minutes to wait for the ChatGPT login while another job holds it, before reviewing on Claude. One login is lent to one job at a time, so on a busy repository collisions are expected. Without a fallback the wait is 10 minutes, as before, since there is nothing else to review with."
+        type: number
+        default: 2
       reviewer-ref:
         description: "Ref of the reviewer repo to check out for the run. Defaults to the caller's own ref so a pinned caller stays pinned end to end; @main here would have quietly un-pinned it."
         type: string
@@ -226,6 +234,10 @@ jobs:
       slack_ts: ${{ steps.slackstart.outputs.ts }}
       cost: ${{ steps.cost.outputs.cost || steps.cost_codex.outputs.cost }}
       replies: ${{ steps.draft_replies.outputs.count }}
+      # The engine that reviewed, and why it is not the one asked for when
+      # codex-fallback put the review on Claude.
+      engine: ${{ steps.effective.outputs.engine }}
+      fallback: ${{ steps.effective.outputs.fallback }}
     timeout-minutes: ${{ inputs.timeout-minutes }}
     permissions:
       contents: read
@@ -633,9 +645,41 @@ jobs:
           ENGINE: ${{ inputs.engine }}
           CODEX_CRED: ${{ inputs.codex-credential }}
           OPENAI_KEY: ${{ inputs.engine == 'codex' && secrets.OPENAI_API_KEY || '' }}
+          FALLBACK: ${{ inputs.codex-fallback }}
+          LEASE_WAIT: ${{ inputs.codex-lease-wait }}
         run: |
-          # engine: codex has its own credentials, and the Claude ones are not
-          # read on that path.
+          # The Claude credential, checked the same way for engine: claude and
+          # for a codex review that may fall back to Claude. Sets ERR or WARN,
+          # each "title::message", and fails when the credential is missing.
+          claude_check() {
+            ERR=""; WARN=""
+            case "$CRED" in
+              api-key)
+                [ -n "$API_KEY" ] || ERR="Missing ANTHROPIC_API_KEY::This repo has no ANTHROPIC_API_KEY secret. Add it in Settings → Secrets and variables → Actions. It is set per repo on purpose, so this repo's review cost bills to its own key." ;;
+              subscription)
+                if [ -z "$OAUTH" ]; then
+                  ERR="Missing CLAUDE_CODE_OAUTH_TOKEN::claude-credential is 'subscription' but no token is set."
+                else
+                  WARN="Subscription credential in CI::A subscription token is an individual's own credential and bills to them. Any workflow in this repo can read it. api-key with a spend cap is the right credential for CI."
+                fi ;;
+              openrouter)
+                if [ -z "$OR_KEY" ]; then
+                  ERR="Missing OPENROUTER_API_KEY::claude-credential is 'openrouter' but no OPENROUTER_API_KEY reached this workflow. Add it in Settings → Secrets and variables → Actions, and pass it in the caller's secrets."
+                # An OpenRouter id is vendor/model. The default, claude-opus-5, is
+                # not one, and a run that guessed would bill a model nobody chose.
+                elif ! [[ "$MODEL" =~ ^[a-z0-9][a-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._:-]*$ ]]; then
+                  ERR="No OpenRouter model::claude-credential is 'openrouter', so model must be an OpenRouter id such as openai/gpt-6.2-sol."
+                else
+                  WARN="OpenRouter credential is a Preview::This review runs on $MODEL through OpenRouter. Review quality on non-Claude models has not been measured to the bar Claude is held to, so read its verdict as advisory until it has been."
+                fi ;;
+              *)
+                ERR="Unknown credential mode::claude-credential must be 'api-key', 'subscription' or 'openrouter', got '$CRED'." ;;
+            esac
+            [ -z "$ERR" ]
+          }
+          # engine: codex has its own credentials. The Claude ones are read on
+          # that path only to know whether a codex-fallback to Claude can run;
+          # nothing fails or warns for them there.
           case "${ENGINE:-claude}" in
             claude) ;;
             codex)
@@ -646,9 +690,26 @@ jobs:
                     exit 1
                   fi ;;
                 chatgpt)
-                  # Borrowed from the Checkmate console by the lease step,
+                  # Borrowed from the Checkmate console by the engine step,
                   # which says why when it cannot be.
-                  echo "::warning title=ChatGPT login in CI::codex-credential 'chatgpt' runs this review on the tenant's ChatGPT plan, lent to one job at a time. OpenAI allows that for private automation only; api-key with a budget is the right credential for CI." ;;
+                  echo "::warning title=ChatGPT login in CI::codex-credential 'chatgpt' runs this review on the tenant's ChatGPT plan, lent to one job at a time. OpenAI allows that for private automation only; api-key with a budget is the right credential for CI."
+                  case "${FALLBACK:-claude}" in
+                    claude)
+                      case "${LEASE_WAIT:-}" in
+                        ''|*[!0-9]*) echo "::error title=Unknown codex-lease-wait::codex-lease-wait must be a whole number of minutes from 0 to 30, got '${LEASE_WAIT:-}'."; exit 1 ;;
+                      esac
+                      [ "$LEASE_WAIT" -le 30 ] || { echo "::error title=Unknown codex-lease-wait::codex-lease-wait must be a whole number of minutes from 0 to 30, got '$LEASE_WAIT'."; exit 1; }
+                      if claude_check; then
+                        echo "claude_ok=true" >> "$GITHUB_OUTPUT"
+                      else
+                        echo "claude_ok=false" >> "$GITHUB_OUTPUT"
+                        echo "claude_why=${ERR%%::*}: ${ERR#*::}" >> "$GITHUB_OUTPUT"
+                      fi ;;
+                    none) ;;
+                    *)
+                      echo "::error title=Unknown codex-fallback::codex-fallback must be 'claude' or 'none', got '$FALLBACK'."
+                      exit 1 ;;
+                  esac ;;
                 *)
                   echo "::error title=Unknown Codex credential::codex-credential must be 'api-key' or 'chatgpt', got '$CODEX_CRED'."
                   exit 1 ;;
@@ -659,34 +720,11 @@ jobs:
               echo "::error title=Unknown engine::engine must be 'claude' or 'codex', got '$ENGINE'."
               exit 1 ;;
           esac
-          case "$CRED" in
-            api-key)
-              if [ -z "$API_KEY" ]; then
-                echo "::error title=Missing ANTHROPIC_API_KEY::This repo has no ANTHROPIC_API_KEY secret. Add it in Settings → Secrets and variables → Actions. It is set per repo on purpose, so this repo's review cost bills to its own key."
-                exit 1
-              fi ;;
-            subscription)
-              if [ -z "$OAUTH" ]; then
-                echo "::error title=Missing CLAUDE_CODE_OAUTH_TOKEN::claude-credential is 'subscription' but no token is set."
-                exit 1
-              fi
-              echo "::warning title=Subscription credential in CI::A subscription token is an individual's own credential and bills to them. Any workflow in this repo can read it. api-key with a spend cap is the right credential for CI." ;;
-            openrouter)
-              if [ -z "$OR_KEY" ]; then
-                echo "::error title=Missing OPENROUTER_API_KEY::claude-credential is 'openrouter' but no OPENROUTER_API_KEY reached this workflow. Add it in Settings → Secrets and variables → Actions, and pass it in the caller's secrets."
-                exit 1
-              fi
-              # An OpenRouter id is vendor/model. The default, claude-opus-5, is
-              # not one, and a run that guessed would bill a model nobody chose.
-              if ! [[ "$MODEL" =~ ^[a-z0-9][a-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._:-]*$ ]]; then
-                echo "::error title=No OpenRouter model::claude-credential is 'openrouter', so model must be an OpenRouter id such as openai/gpt-6.2-sol."
-                exit 1
-              fi
-              echo "::warning title=OpenRouter credential is a Preview::This review runs on $MODEL through OpenRouter. Review quality on non-Claude models has not been measured to the bar Claude is held to, so read its verdict as advisory until it has been." ;;
-            *)
-              echo "::error title=Unknown credential mode::claude-credential must be 'api-key', 'subscription' or 'openrouter', got '$CRED'."
-              exit 1 ;;
-          esac
+          if ! claude_check; then
+            echo "::error title=$ERR"
+            exit 1
+          fi
+          [ -z "$WARN" ] || echo "::warning title=$WARN"
 
       # A hand-started review with a verdict already on this exact commit has
       # nothing to do. Exiting here costs seconds and no tokens, which is what
@@ -893,9 +931,93 @@ jobs:
             exit "$rc"
           fi
 
+      # WHICH ENGINE REVIEWS. Decided once, here, and every engine-specific
+      # step after this reads steps.engine.outputs.engine (and, from the
+      # review on, steps.effective.outputs.engine), never inputs.engine. For
+      # engine: claude, and for codex on an API key, it is the input.
+      #
+      # codex-credential: chatgpt borrows the tenant's ChatGPT login from
+      # Checkmate for this job alone (lindamar-reviewer-platform,
+      # docs/pipeline-config.md, "The ChatGPT login lease"): an OIDC token
+      # exchanged for the auth.json, written to CODEX_HOME with mode 600. Its
+      # own step, because the review steps have no OIDC request variables. One
+      # login is lent to one job at a time, so on a busy repository another
+      # job often holds it. With codex-fallback: claude and a Claude
+      # credential, a login that cannot be lent for a reason that is not this
+      # caller's configuration (busy after codex-lease-wait, not set, needs a
+      # new upload, unreadable, Checkmate not answering) makes this a Claude
+      # review: engine=claude, fallback=<reason>, and nothing to give back.
+      # A policy refusal fails here whatever codex-fallback says. Without a
+      # fallback the login is waited for up to ten minutes, as before.
+      #
+      # A granted lease with a fallback available also sets standby=claude:
+      # the Claude CLI is installed as well, so that OpenAI refusing the
+      # login during the review can still end in a Claude review.
+      - name: Decide which engine reviews
+        id: engine
+        if: steps.already.outputs.skip != 'true' && steps.triage.outputs.skip == ''
+        working-directory: .lindamar-reviewer
+        env:
+          ENGINE: ${{ inputs.engine }}
+          CODEX_CRED: ${{ inputs.codex-credential }}
+          FALLBACK: ${{ inputs.codex-fallback }}
+          LEASE_WAIT: ${{ inputs.codex-lease-wait }}
+          CLAUDE_OK: ${{ steps.cred.outputs.claude_ok }}
+          CLAUDE_WHY: ${{ steps.cred.outputs.claude_why }}
+          CHECKMATE_URL: ${{ inputs.checkmate-url }}
+          TIMEOUT: ${{ inputs.timeout-minutes }}
+        run: |
+          set -uo pipefail
+          engine="${ENGINE:-claude}"
+          if [ "$engine" != codex ] || [ "${CODEX_CRED:-}" != chatgpt ]; then
+            echo "engine=$engine" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # A fallback needs codex-fallback: claude, a Claude credential, and
+          # a reviewer whose codex-login.sh can say why it lent nothing.
+          can=""; why=""
+          if [ "${FALLBACK:-claude}" = claude ]; then
+            if [ "${CLAUDE_OK:-}" != true ]; then why="${CLAUDE_WHY:-the Claude credential was not checked}"
+            elif ! grep -q -- '--fallback' scripts/codex-login.sh; then why="the reviewer at this ref cannot fall back (scripts/codex-login.sh has no --fallback)"
+            else can=true; fi
+          fi
+          wait=600; soft=()
+          if [ -n "$can" ]; then wait=$(( ${LEASE_WAIT:-2} * 60 )); soft=(--fallback); fi
+          rc=0
+          out="$(bash scripts/codex-login.sh lease --url "$CHECKMATE_URL" --home "$RUNNER_TEMP/codex-home" \
+                   --job agent --timeout-minutes "$TIMEOUT" --wait-seconds "$wait" ${soft[@]+"${soft[@]}"})" || rc=$?
+          get() { printf '%s\n' "$out" | sed -n "s/^$1=//p" | head -1; }
+          if [ "$rc" -eq 0 ]; then
+            id="$(get lease_id)"
+            [ -n "$id" ] || { echo "::error title=No ChatGPT lease::Checkmate lent the login without a lease id."; exit 1; }
+            {
+              echo "engine=codex"
+              echo "lease_id=$id"
+              [ -z "$can" ] || echo "standby=claude"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$rc" -ne 3 ]; then
+            # Its reason is above. Say why it did not become a Claude review.
+            if [ "${FALLBACK:-claude}" = claude ] && [ -n "$why" ]; then
+              echo "::error title=No fallback to Claude::codex-fallback is 'claude', but $why, so the review did not run on Claude either."
+            fi
+            exit 1
+          fi
+          reason="$(get refused)"; detail="$(get detail)"
+          case "$reason" in
+            busy|login_not_set|login_needs_reupload|secret_unreadable|unreachable|login_unusable) ;;
+            *) echo "::error title=ChatGPT login not lent::codex-login.sh gave no reason the workflow knows ('$reason')."; exit 1 ;;
+          esac
+          {
+            echo "engine=claude"
+            echo "fallback=$reason"
+            echo "detail=$detail"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Install the Claude CLI
         id: cli
-        if: steps.already.outputs.skip != 'true' && steps.triage.outputs.skip == '' && inputs.engine != 'codex'
+        if: steps.already.outputs.skip != 'true' && steps.triage.outputs.skip == '' && (steps.engine.outputs.engine == 'claude' || steps.engine.outputs.standby == 'claude')
         run: |
           npm install -g "@anthropic-ai/claude-code@${LINDAMAR_CLAUDE_CLI_VERSION}"
           claude --version
@@ -911,7 +1033,7 @@ jobs:
       # write is the thing this whole job is built not to have.
       - name: Install the Codex CLI, and prove its sandbox
         id: codex_cli
-        if: steps.already.outputs.skip != 'true' && steps.triage.outputs.skip == '' && inputs.engine == 'codex'
+        if: steps.already.outputs.skip != 'true' && steps.triage.outputs.skip == '' && steps.engine.outputs.engine == 'codex'
         run: |
           set -euo pipefail
           npm install -g "@openai/codex@${LINDAMAR_CODEX_CLI_VERSION}"
@@ -957,7 +1079,7 @@ jobs:
       # and a `limit` the gate names. Anything unreadable starts the review.
       - name: Keep the usage reserve free
         id: reserve
-        if: steps.already.outputs.skip != 'true' && steps.triage.outputs.skip == '' && inputs.usage-reserve-percent > 0 && inputs.claude-credential == 'subscription' && inputs.engine != 'codex'
+        if: steps.already.outputs.skip != 'true' && steps.triage.outputs.skip == '' && inputs.usage-reserve-percent > 0 && inputs.claude-credential == 'subscription' && steps.engine.outputs.engine == 'claude'
         env:
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           RESERVE: ${{ inputs.usage-reserve-percent }}
@@ -1040,8 +1162,179 @@ jobs:
             echo "::warning title=Slack not notified::$why. $then_what"
           fi
 
+      # engine: codex, step 1 of 2. Everything the review skill does before it
+      # launches sub-agents, with this job's read token and no model
+      # credential: stacks, the previous round, the scope, the candidate
+      # inventory, one packet per stack and aspect, and the diff and head
+      # content of every changed file. The model step after it then needs no
+      # GitHub token and no network for its commands (scripts/codex-review.sh).
+      - name: Prepare the Codex review
+        id: codex_prep
+        if: steps.already.outputs.skip != 'true' && steps.triage.outputs.skip == '' && steps.engine.outputs.engine == 'codex'
+        working-directory: .lindamar-reviewer
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ steps.pr.outputs.number }}
+          LINDAMAR_SCOPE: ${{ steps.triage.outputs.scope }}
+          LINDAMAR_SCOPE_FROM: ${{ steps.triage.outputs.scope_from }}
+          CODEX_MODEL: ${{ inputs.codex-model }}
+        run: |
+          set -uo pipefail
+          mkdir -p "$RUNNER_TEMP/state"
+          export LINDAMAR_STATE_DIR="$RUNNER_TEMP/state"
+          rc=0
+          bash scripts/codex-review.sh prepare --repo "$REPO" --pr "$PR" --work "$RUNNER_TEMP/codex-work" || rc=$?
+          [ "$rc" -ne 0 ] || bash scripts/codex-review.sh home --work "$RUNNER_TEMP/codex-work" \
+            --home "$RUNNER_TEMP/codex-home" ${CODEX_MODEL:+--model "$CODEX_MODEL"} || rc=$?
+          if [ "$rc" -ne 0 ]; then
+            echo "::error title=The Codex review could not be prepared::Its reason is above. No model ran and nothing was spent."
+            exit "$rc"
+          fi
+
+      # engine: codex, step 2 of 2. Codex in a read-only sandbox (proved above)
+      # with approval never, no web search, no AGENTS.md, and an environment
+      # rebuilt from nothing: PATH, an empty HOME, CODEX_HOME and the model
+      # credential. No GitHub token is in this step at all. Its final answer
+      # must match codex/review-output.schema.json; handoff then writes the
+      # same files the Claude path hands over, and the post job takes them
+      # exactly as it takes Claude's.
+      - name: Review with Codex
+        id: review_codex
+        if: steps.already.outputs.skip != 'true' && steps.triage.outputs.skip == '' && steps.engine.outputs.engine == 'codex'
+        working-directory: .lindamar-reviewer
+        env:
+          CODEX_API_KEY: ${{ steps.engine.outputs.engine == 'codex' && inputs.codex-credential == 'api-key' && secrets.OPENAI_API_KEY || '' }}
+          LINDAMAR_HANDOFF_DIR: ${{ runner.temp }}/handoff
+          STANDBY: ${{ steps.engine.outputs.standby }}
+        run: |
+          set -uo pipefail
+          O="$RUNNER_TEMP/codex-out"
+          rc=0
+          # The runner's file commands are not the agent's: run builds its
+          # environment with env -i, and this removes them from the shell too.
+          env -u GITHUB_OUTPUT -u GITHUB_ENV -u GITHUB_PATH -u GITHUB_STEP_SUMMARY -u GITHUB_STATE \
+            -u ACTIONS_ID_TOKEN_REQUEST_URL -u ACTIONS_ID_TOKEN_REQUEST_TOKEN \
+          bash scripts/codex-review.sh run --work "$RUNNER_TEMP/codex-work" --home "$RUNNER_TEMP/codex-home" --out "$O" || rc=$?
+          unset CODEX_API_KEY
+          # Where the Claude path keeps its transcript, so upload-transcript
+          # and the cost step find it.
+          cp "$O/stream.jsonl" "$RUNNER_TEMP/stream.jsonl" 2>/dev/null || : > "$RUNNER_TEMP/stream.jsonl"
+          cp "$O/stream.err" "$RUNNER_TEMP/stream.err" 2>/dev/null || : > "$RUNNER_TEMP/stream.err"
+          jq -R -r 'fromjson? | select(.type == "item.completed" and .item.type == "agent_message") | .item.text' \
+            "$RUNNER_TEMP/stream.jsonl" 2>/dev/null | tail -c 4000 || true
+          if [ -s "$RUNNER_TEMP/stream.err" ]; then
+            echo "--- stderr from Codex ---"; tail -c 2000 "$RUNNER_TEMP/stream.err"
+          fi
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          [ "$rc" -ne 97 ] || { echo "::error title=The answer held a credential, nothing was posted::The Codex answer contained the model credential, which is what a prompt injection in the diff would aim for. It was discarded. Read the diff for text addressed to an AI reviewer."; exit 1; }
+          # A run that exited 0 and handed nothing over reviewed nothing the
+          # post job can use, so it is classified like a failed exit.
+          nohandoff=""
+          if [ "$rc" -eq 0 ]; then
+            rm -rf "$LINDAMAR_HANDOFF_DIR"
+            bash scripts/codex-review.sh handoff --work "$RUNNER_TEMP/codex-work" --result "$O/last.json" \
+              --out "$LINDAMAR_HANDOFF_DIR" || { nohandoff="a valid final answer"; rc=1; }
+          fi
+          if [ "$rc" -ne 0 ]; then
+            # From the run's own events, never from the review's prose
+            # (scripts/codex-stream.sh classify, on recorded 0.170.0 output).
+            c="$(bash scripts/codex-stream.sh classify --stream "$RUNNER_TEMP/stream.jsonl" --err "$RUNNER_TEMP/stream.err" 2>/dev/null || true)"
+            get() { printf '%s\n' "$c" | sed -n "s/^$1=//p" | head -1; }
+            blocked="$(get blocked)"; limit="$(get limit)"; reset="$(get resetAt)"; reason="$(get reason)"
+            if [ -z "$blocked" ] && [ "$(get worked)" != true ]; then blocked=nowork; fi
+            if [ -n "$nohandoff" ] && [ "$blocked" != usage ] && [ "$blocked" != auth ]; then blocked=""; fi
+            printf '%s' "$reset" | grep -Eq '^[A-Za-z0-9:,/()_+. -]{1,48}$' || reset=""
+            # OpenAI refused the leased login, and Claude stands by: this is
+            # not the check's failure but a Claude review's start. The login
+            # file and what Codex left go now, before an agent that can read
+            # the disk runs; the next step releases the lease as auth_failed.
+            if [ "$blocked" = auth ] && [ "${STANDBY:-}" = claude ]; then
+              rm -rf "$RUNNER_TEMP/codex-home/auth.json" "$RUNNER_TEMP/codex-home/sessions" "$RUNNER_TEMP/codex-work" "$LINDAMAR_HANDOFF_DIR"
+              echo "fallback=auth_failed" >> "$GITHUB_OUTPUT"
+              echo "  OpenAI refused the ChatGPT login; the review runs on Claude instead (codex-fallback: claude)"
+              exit 0
+            fi
+            echo "blocked=$blocked" >> "$GITHUB_OUTPUT"
+            [ "$blocked" != usage ] || echo "limit=$limit" >> "$GITHUB_OUTPUT"
+            [ "$blocked" != usage ] || [ -z "$reset" ] || echo "resetAt=$reset" >> "$GITHUB_OUTPUT"
+            [ -z "$reason" ] || echo "  Codex said: $reason"
+            case "$blocked" in
+              usage) echo "::error title=OpenAI usage limit reached ($limit), nothing was reviewed::The reviewer's OpenAI credential is out of usage${reset:+ until $reset}, so this pull request was not checked. This is not a finding and nothing here is the author's to fix. The required check says what to do." ;;
+              auth)  echo "::error title=Credential rejected, nothing was reviewed::OpenAI refused the reviewer's credential. This pull request was not checked, and retrying will not help until the secret or the login is replaced." ;;
+              nowork) echo "::error title=The reviewer did no work::Codex started and stopped without a command, a sub-agent or an output token, so it never got as far as reading the diff. Its stderr and events are above." ;;
+              *) if [ -n "$nohandoff" ]; then
+                   echo "::error title=The agent handed nothing over::Codex exited 0 without $nohandoff, so there is no review to post."
+                 else
+                   echo "::error title=The reviewer exited $rc::Codex ran and failed. Its stderr and events are above. Nothing was posted, so the gate is red for that reason and not for a finding."
+                 fi ;;
+            esac
+            exit "$rc"
+          fi
+          echo "ran=true" >> "$GITHUB_OUTPUT"
+
+      # OpenAI refused the leased login and the review falls back to Claude:
+      # the lease goes back as auth_failed now, not at the end of the job, so
+      # the next job is told at once that the login needs a new upload rather
+      # than waiting on a lease this job no longer uses.
+      - name: Release the ChatGPT login OpenAI refused
+        if: always() && steps.engine.outputs.lease_id != '' && steps.review_codex.outputs.fallback == 'auth_failed'
+        continue-on-error: true
+        working-directory: .lindamar-reviewer
+        env:
+          CHECKMATE_URL: ${{ inputs.checkmate-url }}
+          LEASE: ${{ steps.engine.outputs.lease_id }}
+        run: |
+          set -uo pipefail
+          bash scripts/codex-login.sh return --url "$CHECKMATE_URL" --home "$RUNNER_TEMP/codex-home" \
+            --lease "$LEASE" --outcome auth_failed || true
+          rm -f "$RUNNER_TEMP/codex-home/auth.json"
+
+      # The engine that reviews from here on: the engine step's, or Claude
+      # when OpenAI refused the login during the Codex review. Every later
+      # step that differs by engine reads this, and so does the post job.
+      # A fallback is said once, here: a notice and the job summary.
+      - name: Settle the engine that reviews
+        id: effective
+        if: always() && steps.engine.outputs.engine != ''
+        env:
+          ENGINE: ${{ steps.engine.outputs.engine }}
+          FALLBACK: ${{ steps.engine.outputs.fallback || steps.review_codex.outputs.fallback }}
+          DETAIL: ${{ steps.engine.outputs.detail }}
+          CRED: ${{ inputs.claude-credential }}
+          WAITED: ${{ inputs.codex-lease-wait }}
+        run: |
+          set -uo pipefail
+          engine="$ENGINE"
+          [ "${FALLBACK:-}" != auth_failed ] || engine=claude
+          echo "engine=$engine" >> "$GITHUB_OUTPUT"
+          [ -n "${FALLBACK:-}" ] || exit 0
+          echo "fallback=$FALLBACK" >> "$GITHUB_OUTPUT"
+          d="$(printf '%s' "${DETAIL:-}" | tr -d '\000-\037' | sed 's/::/: /g' | cut -c1-300)"
+          case "$FALLBACK" in
+            busy)                 why="Codex login ${d:-lent to another job}" ;;
+            login_not_set)        why="No ChatGPT login is set in Checkmate${d:+ ($d)}" ;;
+            login_needs_reupload) why="The ChatGPT login needs a new upload in Checkmate${d:+ ($d)}" ;;
+            secret_unreadable)    why="Checkmate could not read the ChatGPT login${d:+ ($d)}" ;;
+            unreachable)          why="Checkmate did not answer the lease request${d:+ ($d)}" ;;
+            login_unusable)       why="Checkmate lent a login Codex cannot use${d:+ ($d)}" ;;
+            auth_failed)          why="OpenAI refused the ChatGPT login during the Codex review, and it was released as auth_failed" ;;
+            *)                    why="the Codex engine could not run ($FALLBACK)" ;;
+          esac
+          echo "::notice title=Reviewed on Claude, not Codex::$why; reviewed on Claude (codex-fallback: claude, claude-credential: $CRED)."
+          {
+            echo "### Engine"
+            echo ""
+            echo "$why; reviewed on Claude."
+            echo ""
+            echo "- asked for: Codex, on the ChatGPT login"
+            echo "- reviewed on: **Claude**, claude-credential \`$CRED\` (\`codex-fallback: claude\`)"
+            echo "- reason: \`$FALLBACK\`"
+            [ "$FALLBACK" != busy ] || echo "- waited: up to ${WAITED:-2} minute(s) (\`codex-lease-wait\`)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Review
-        if: steps.already.outputs.skip != 'true' && steps.triage.outputs.skip == '' && steps.reserve.outputs.blocked == '' && inputs.engine != 'codex'
+        if: steps.already.outputs.skip != 'true' && steps.triage.outputs.skip == '' && steps.reserve.outputs.blocked == '' && steps.effective.outputs.engine == 'claude'
         id: review
         working-directory: .lindamar-reviewer
         env:
@@ -1226,127 +1519,6 @@ jobs:
           fi
           echo "ran=true" >> "$GITHUB_OUTPUT"
 
-      # engine: codex, step 1 of 2. Everything the review skill does before it
-      # launches sub-agents, with this job's read token and no model
-      # credential: stacks, the previous round, the scope, the candidate
-      # inventory, one packet per stack and aspect, and the diff and head
-      # content of every changed file. The model step after it then needs no
-      # GitHub token and no network for its commands (scripts/codex-review.sh).
-      - name: Prepare the Codex review
-        id: codex_prep
-        if: steps.already.outputs.skip != 'true' && steps.triage.outputs.skip == '' && inputs.engine == 'codex'
-        working-directory: .lindamar-reviewer
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-          PR: ${{ steps.pr.outputs.number }}
-          LINDAMAR_SCOPE: ${{ steps.triage.outputs.scope }}
-          LINDAMAR_SCOPE_FROM: ${{ steps.triage.outputs.scope_from }}
-          CODEX_MODEL: ${{ inputs.codex-model }}
-        run: |
-          set -uo pipefail
-          mkdir -p "$RUNNER_TEMP/state"
-          export LINDAMAR_STATE_DIR="$RUNNER_TEMP/state"
-          rc=0
-          bash scripts/codex-review.sh prepare --repo "$REPO" --pr "$PR" --work "$RUNNER_TEMP/codex-work" || rc=$?
-          [ "$rc" -ne 0 ] || bash scripts/codex-review.sh home --work "$RUNNER_TEMP/codex-work" \
-            --home "$RUNNER_TEMP/codex-home" ${CODEX_MODEL:+--model "$CODEX_MODEL"} || rc=$?
-          if [ "$rc" -ne 0 ]; then
-            echo "::error title=The Codex review could not be prepared::Its reason is above. No model ran and nothing was spent."
-            exit "$rc"
-          fi
-
-      # codex-credential: chatgpt. The tenant's ChatGPT login, borrowed from
-      # Checkmate for this job alone (lindamar-reviewer-platform,
-      # docs/pipeline-config.md, "The ChatGPT login lease"): an OIDC token
-      # exchanged for the auth.json, written to CODEX_HOME with mode 600. A
-      # login another job holds is waited for, up to ten minutes. Its own step,
-      # because the review step has no OIDC request variables.
-      - name: Borrow the ChatGPT login from Checkmate
-        id: codex_lease
-        if: steps.already.outputs.skip != 'true' && steps.triage.outputs.skip == '' && inputs.engine == 'codex' && inputs.codex-credential == 'chatgpt'
-        working-directory: .lindamar-reviewer
-        env:
-          CHECKMATE_URL: ${{ inputs.checkmate-url }}
-          TIMEOUT: ${{ inputs.timeout-minutes }}
-        run: |
-          set -uo pipefail
-          out="$(bash scripts/codex-login.sh lease --url "$CHECKMATE_URL" --home "$RUNNER_TEMP/codex-home" \
-                   --job agent --timeout-minutes "$TIMEOUT" --wait-seconds 600)" || exit 1
-          id="$(printf '%s\n' "$out" | sed -n 's/^lease_id=//p' | head -1)"
-          [ -n "$id" ] || { echo "::error title=No ChatGPT lease::Checkmate lent the login without a lease id."; exit 1; }
-          echo "lease_id=$id" >> "$GITHUB_OUTPUT"
-
-      # engine: codex, step 2 of 2. Codex in a read-only sandbox (proved above)
-      # with approval never, no web search, no AGENTS.md, and an environment
-      # rebuilt from nothing: PATH, an empty HOME, CODEX_HOME and the model
-      # credential. No GitHub token is in this step at all. Its final answer
-      # must match codex/review-output.schema.json; handoff then writes the
-      # same files the Claude path hands over, and the post job takes them
-      # exactly as it takes Claude's.
-      - name: Review with Codex
-        id: review_codex
-        if: steps.already.outputs.skip != 'true' && steps.triage.outputs.skip == '' && inputs.engine == 'codex'
-        working-directory: .lindamar-reviewer
-        env:
-          CODEX_API_KEY: ${{ inputs.engine == 'codex' && inputs.codex-credential == 'api-key' && secrets.OPENAI_API_KEY || '' }}
-          LINDAMAR_HANDOFF_DIR: ${{ runner.temp }}/handoff
-        run: |
-          set -uo pipefail
-          O="$RUNNER_TEMP/codex-out"
-          rc=0
-          # The runner's file commands are not the agent's: run builds its
-          # environment with env -i, and this removes them from the shell too.
-          env -u GITHUB_OUTPUT -u GITHUB_ENV -u GITHUB_PATH -u GITHUB_STEP_SUMMARY -u GITHUB_STATE \
-            -u ACTIONS_ID_TOKEN_REQUEST_URL -u ACTIONS_ID_TOKEN_REQUEST_TOKEN \
-          bash scripts/codex-review.sh run --work "$RUNNER_TEMP/codex-work" --home "$RUNNER_TEMP/codex-home" --out "$O" || rc=$?
-          unset CODEX_API_KEY
-          # Where the Claude path keeps its transcript, so upload-transcript
-          # and the cost step find it.
-          cp "$O/stream.jsonl" "$RUNNER_TEMP/stream.jsonl" 2>/dev/null || : > "$RUNNER_TEMP/stream.jsonl"
-          cp "$O/stream.err" "$RUNNER_TEMP/stream.err" 2>/dev/null || : > "$RUNNER_TEMP/stream.err"
-          jq -R -r 'fromjson? | select(.type == "item.completed" and .item.type == "agent_message") | .item.text' \
-            "$RUNNER_TEMP/stream.jsonl" 2>/dev/null | tail -c 4000 || true
-          if [ -s "$RUNNER_TEMP/stream.err" ]; then
-            echo "--- stderr from Codex ---"; tail -c 2000 "$RUNNER_TEMP/stream.err"
-          fi
-          echo "rc=$rc" >> "$GITHUB_OUTPUT"
-          [ "$rc" -ne 97 ] || { echo "::error title=The answer held a credential, nothing was posted::The Codex answer contained the model credential, which is what a prompt injection in the diff would aim for. It was discarded. Read the diff for text addressed to an AI reviewer."; exit 1; }
-          # A run that exited 0 and handed nothing over reviewed nothing the
-          # post job can use, so it is classified like a failed exit.
-          nohandoff=""
-          if [ "$rc" -eq 0 ]; then
-            rm -rf "$LINDAMAR_HANDOFF_DIR"
-            bash scripts/codex-review.sh handoff --work "$RUNNER_TEMP/codex-work" --result "$O/last.json" \
-              --out "$LINDAMAR_HANDOFF_DIR" || { nohandoff="a valid final answer"; rc=1; }
-          fi
-          if [ "$rc" -ne 0 ]; then
-            # From the run's own events, never from the review's prose
-            # (scripts/codex-stream.sh classify, on recorded 0.170.0 output).
-            c="$(bash scripts/codex-stream.sh classify --stream "$RUNNER_TEMP/stream.jsonl" --err "$RUNNER_TEMP/stream.err" 2>/dev/null || true)"
-            get() { printf '%s\n' "$c" | sed -n "s/^$1=//p" | head -1; }
-            blocked="$(get blocked)"; limit="$(get limit)"; reset="$(get resetAt)"; reason="$(get reason)"
-            if [ -z "$blocked" ] && [ "$(get worked)" != true ]; then blocked=nowork; fi
-            if [ -n "$nohandoff" ] && [ "$blocked" != usage ] && [ "$blocked" != auth ]; then blocked=""; fi
-            printf '%s' "$reset" | grep -Eq '^[A-Za-z0-9:,/()_+. -]{1,48}$' || reset=""
-            echo "blocked=$blocked" >> "$GITHUB_OUTPUT"
-            [ "$blocked" != usage ] || echo "limit=$limit" >> "$GITHUB_OUTPUT"
-            [ "$blocked" != usage ] || [ -z "$reset" ] || echo "resetAt=$reset" >> "$GITHUB_OUTPUT"
-            [ -z "$reason" ] || echo "  Codex said: $reason"
-            case "$blocked" in
-              usage) echo "::error title=OpenAI usage limit reached ($limit), nothing was reviewed::The reviewer's OpenAI credential is out of usage${reset:+ until $reset}, so this pull request was not checked. This is not a finding and nothing here is the author's to fix. The required check says what to do." ;;
-              auth)  echo "::error title=Credential rejected, nothing was reviewed::OpenAI refused the reviewer's credential. This pull request was not checked, and retrying will not help until the secret or the login is replaced." ;;
-              nowork) echo "::error title=The reviewer did no work::Codex started and stopped without a command, a sub-agent or an output token, so it never got as far as reading the diff. Its stderr and events are above." ;;
-              *) if [ -n "$nohandoff" ]; then
-                   echo "::error title=The agent handed nothing over::Codex exited 0 without $nohandoff, so there is no review to post."
-                 else
-                   echo "::error title=The reviewer exited $rc::Codex ran and failed. Its stderr and events are above. Nothing was posted, so the gate is red for that reason and not for a finding."
-                 fi ;;
-            esac
-            exit "$rc"
-          fi
-          echo "ran=true" >> "$GITHUB_OUTPUT"
-
       # The review, as data, for the post job. Retention is a day: it quotes
       # findings about this repository's code and nothing needs it afterwards.
       - uses: actions/upload-artifact@v4
@@ -1416,14 +1588,14 @@ jobs:
         timeout-minutes: 5
         working-directory: .lindamar-reviewer
         env:
-          ANTHROPIC_API_KEY: ${{ inputs.engine != 'codex' && inputs.claude-credential == 'api-key' && secrets.ANTHROPIC_API_KEY || '' }}
-          CLAUDE_CODE_OAUTH_TOKEN: ${{ inputs.engine != 'codex' && inputs.claude-credential == 'subscription' && secrets.CLAUDE_CODE_OAUTH_TOKEN || '' }}
+          ANTHROPIC_API_KEY: ${{ steps.effective.outputs.engine != 'codex' && inputs.claude-credential == 'api-key' && secrets.ANTHROPIC_API_KEY || '' }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ steps.effective.outputs.engine != 'codex' && inputs.claude-credential == 'subscription' && secrets.CLAUDE_CODE_OAUTH_TOKEN || '' }}
           LINDAMAR_REPLY_MODEL: sonnet
           LINDAMAR_MODEL: ${{ inputs.model }}
           LINDAMAR_CREDENTIAL: ${{ inputs.claude-credential }}
-          LINDAMAR_OPENROUTER_KEY: ${{ inputs.engine != 'codex' && inputs.claude-credential == 'openrouter' && secrets.OPENROUTER_API_KEY || '' }}
-          LINDAMAR_ENGINE: ${{ inputs.engine }}
-          CODEX_API_KEY: ${{ inputs.engine == 'codex' && inputs.codex-credential == 'api-key' && secrets.OPENAI_API_KEY || '' }}
+          LINDAMAR_OPENROUTER_KEY: ${{ steps.effective.outputs.engine != 'codex' && inputs.claude-credential == 'openrouter' && secrets.OPENROUTER_API_KEY || '' }}
+          LINDAMAR_ENGINE: ${{ steps.effective.outputs.engine }}
+          CODEX_API_KEY: ${{ steps.effective.outputs.engine == 'codex' && inputs.codex-credential == 'api-key' && secrets.OPENAI_API_KEY || '' }}
         run: |
           set -uo pipefail
           # engine: codex drafts with Codex (scripts/thread-replies.sh): no
@@ -1498,19 +1670,22 @@ jobs:
 
       - name: Record what it cost
         id: cost
-        if: always() && steps.triage.outputs.skip == '' && inputs.engine != 'codex'
+        if: always() && steps.triage.outputs.skip == '' && (steps.effective.outputs.engine || inputs.engine) != 'codex'
         env:
           REPO: ${{ github.repository }}
           PR: ${{ steps.pr.outputs.number }}
           SHA: ${{ steps.pr.outputs.sha }}
           CRED: ${{ inputs.claude-credential }}
+          # Set only when a codex review fell back to Claude: the record then
+          # says which engine ran, which was asked for, and why.
+          FALLBACK: ${{ steps.effective.outputs.fallback }}
         run: |
           # Cost per repo is the whole reason the API key is set per repo, so it
           # has to be recorded per run rather than read off a console later. An
           # incomplete run still spent money and is marked, not dropped.
           S="$RUNNER_TEMP/stream.jsonl"
           [ -s "$S" ] || { echo "no stream to cost"; exit 0; }
-          jq -cn --arg repo "$REPO" --arg pr "$PR" --arg sha "$SHA" --arg cred "$CRED" '
+          jq -cn --arg repo "$REPO" --arg pr "$PR" --arg sha "$SHA" --arg cred "$CRED" --arg fb "${FALLBACK:-}" '
             [inputs] as $ev
             | ($ev | map(select(.type=="result")) | last) as $r
             | ($ev | map(select(.type=="assistant") | .message.usage // empty)) as $u
@@ -1533,12 +1708,13 @@ jobs:
                 note: (if $r == null then "run did not finish; usage is a lower bound"
                        elif $cred == "openrouter" then "OpenRouter bills this run; the real cost is in the usage of the key on OpenRouter"
                        else null end) }
+            + (if $fb != "" then { engine: "claude", requestedEngine: "codex", fallback: $fb } else {} end)
           ' "$S" > "$RUNNER_TEMP/cost.json"
           cat "$RUNNER_TEMP/cost.json"
           {
             echo "### Review cost"
             echo ""
-            jq -r '"- repo: `\(.repo)` PR #\(.pr)\n- credential: `\(.credential)`\n- cost: \(if .costUsd then "$" + (.costUsd|tostring) + " (basis: " + (.costBasis // "?") + ")" elif .credential == "openrouter" and .complete then "billed by OpenRouter, see the usage of the key there (the figure the CLI reports, not a real cost: $" + ((.cliCostUsd // 0)|tostring) + ")" else "not recorded — the run did not finish, so this is **not** free" end)\n- output tokens: \(.outputTokens)\n- agents: \(.subagents // "?")  turns: \(.turns // "?")"' \
+            jq -r '"- repo: `\(.repo)` PR #\(.pr)\n" + (if .fallback then "- engine: Claude, in place of Codex (`\(.fallback)`)\n" else "" end) + "- credential: `\(.credential)`\n- cost: \(if .costUsd then "$" + (.costUsd|tostring) + " (basis: " + (.costBasis // "?") + ")" elif .credential == "openrouter" and .complete then "billed by OpenRouter, see the usage of the key there (the figure the CLI reports, not a real cost: $" + ((.cliCostUsd // 0)|tostring) + ")" else "not recorded — the run did not finish, so this is **not** free" end)\n- output tokens: \(.outputTokens)\n- agents: \(.subagents // "?")  turns: \(.turns // "?")"' \
               "$RUNNER_TEMP/cost.json"
           } >> "$GITHUB_STEP_SUMMARY"
           # For the Slack line, which the post job writes.
@@ -1548,14 +1724,16 @@ jobs:
       # file as Codex left it, refreshed or not. `unused` if Codex never ran,
       # `auth_failed` if OpenAI refused it (nothing is lent then until an admin
       # uploads a new one), `lost` if there is nothing valid to give back.
-      # Then the file is deleted.
+      # Then the file is deleted. A login refused before a Claude fallback was
+      # released already, by the step after the Codex review. A login that was
+      # never lent has nothing to give back: the engine step set no lease_id.
       - name: Give the ChatGPT login back to Checkmate
-        if: always() && steps.codex_lease.outputs.lease_id != ''
+        if: always() && steps.engine.outputs.lease_id != '' && steps.review_codex.outputs.fallback != 'auth_failed'
         continue-on-error: true
         working-directory: .lindamar-reviewer
         env:
           CHECKMATE_URL: ${{ inputs.checkmate-url }}
-          LEASE: ${{ steps.codex_lease.outputs.lease_id }}
+          LEASE: ${{ steps.engine.outputs.lease_id }}
           REVIEWED: ${{ steps.review_codex.outcome }}
           BLOCKED: ${{ steps.review_codex.outputs.blocked }}
         run: |
@@ -1577,7 +1755,7 @@ jobs:
       # files go, because they quote the diff.
       - name: Record what the Codex review cost
         id: cost_codex
-        if: always() && steps.triage.outputs.skip == '' && inputs.engine == 'codex'
+        if: always() && steps.triage.outputs.skip == '' && (steps.effective.outputs.engine || inputs.engine) == 'codex'
         env:
           REPO: ${{ github.repository }}
           PR: ${{ steps.pr.outputs.number }}
@@ -1655,6 +1833,7 @@ jobs:
           O_TRIAGE: ${{ steps.triage.outcome }}
           O_CRED: ${{ steps.cred.outcome }}
           O_ALREADY: ${{ steps.already.outcome }}
+          O_ENGINE: ${{ steps.engine.outcome }}
           O_APP: ${{ steps.app.outcome }}
           O_CHECKOUT: ${{ steps.checkout.outcome }}
           O_SKILLS: ${{ steps.skills.outcome }}
@@ -1672,11 +1851,12 @@ jobs:
                    "Mint a reviewer App token=${O_APP:-}" \
                    "Check out the reviewer=${O_CHECKOUT:-}" \
                    "Install the reviewer's skills, and verify the count=${O_SKILLS:-}" \
+                   "Decide which engine reviews=${O_ENGINE:-}" \
                    "Install the Claude CLI=${O_CLI:-}" \
-                   "Review=${O_REVIEW:-}" \
                    "Install the Codex CLI, and prove its sandbox=${O_CODEX_CLI:-}" \
                    "Prepare the Codex review=${O_CODEX_PREP:-}" \
-                   "Review with Codex=${O_REVIEW_CODEX:-}"; do
+                   "Review with Codex=${O_REVIEW_CODEX:-}" \
+                   "Review=${O_REVIEW:-}"; do
             if [ "${p##*=}" = failure ]; then echo "step=${p%=*}" >> "$GITHUB_OUTPUT"; echo "  first failed: ${p%=*}"; break; fi
           done
 
@@ -1838,6 +2018,9 @@ jobs:
           LINDAMAR_VERDICT_MODE: ${{ inputs.verdict-mode }}
           SIGNING: ${{ steps.key.outputs.signing }}
           H: ${{ runner.temp }}/handoff
+          # Set when engine: codex was asked for and Claude reviewed.
+          ENGINE: ${{ needs.agent.outputs.engine }}
+          FALLBACK: ${{ needs.agent.outputs.fallback }}
           # Triage's scope, from the agent job's outputs and not from the
           # agent's handoff: post-review.sh enforces it (no finding outside
           # it, every open critical outside it carried).
@@ -1867,6 +2050,22 @@ jobs:
           jq '[ .[] | {path, line, severity, rule, title, body, suggestion, fixPrompt, sweptFiles, rootCause, alsoCheck, verifyBeforePush}
                     | with_entries(select(.value != null)) ]' "$H/findings.json" > "$RUNNER_TEMP/findings.json" \
             || bad "findings.json could not be normalised"
+          # Which engine produced this review, when it is not the one asked
+          # for. Fixed words per reason, written here and not by the agent;
+          # who held the login is in the job summary, not on the pull request.
+          if [ "${ENGINE:-}" = claude ]; then
+            case "${FALLBACK:-}" in
+              busy)                 fb="the ChatGPT login was lent to another job" ;;
+              login_not_set)        fb="no ChatGPT login is set in Checkmate" ;;
+              login_needs_reupload) fb="the ChatGPT login needs a new upload" ;;
+              secret_unreadable)    fb="Checkmate could not read the ChatGPT login" ;;
+              unreachable)          fb="Checkmate did not answer the lease request" ;;
+              login_unusable)       fb="Checkmate lent a login Codex cannot use" ;;
+              auth_failed)          fb="OpenAI refused the ChatGPT login" ;;
+              *)                    fb="" ;;
+            esac
+            [ -z "$fb" ] || printf '\n<sub>Reviewed on Claude: the Codex engine was asked for, but %s.</sub>\n' "$fb" >> "$H/summary.md"
+          fi
           extra=()
           # Earlier findings the model ruled fixed in another file (optional;
           # added after an earlier incident). Untrusted like the rest: bounded in size, and
@@ -1972,7 +2171,7 @@ jobs:
           BLOCKED: ${{ needs.agent.outputs.blocked }}
           LIMIT: ${{ needs.agent.outputs.limit }}
           RESET_AT: ${{ needs.agent.outputs.reset_at }}
-          ENGINE: ${{ inputs.engine }}
+          ENGINE: ${{ needs.agent.outputs.engine || inputs.engine }}
         run: |
           # Read the verdict from GitHub, not from the transcript. A run can print
           # a confident summary and never have posted anything — that happened
@@ -2207,7 +2406,7 @@ jobs:
           BLOCKED: ${{ needs.agent.outputs.blocked }}
           RESET_AT: ${{ needs.agent.outputs.reset_at }}
           LIMIT_MSG: ${{ steps.gate.outputs.limit_msg }}
-          ENGINE: ${{ inputs.engine }}
+          ENGINE: ${{ needs.agent.outputs.engine || inputs.engine }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -uo pipefail
