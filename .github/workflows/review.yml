@@ -86,13 +86,13 @@ on:
         type: string
         default: ""
       codex-fallback:
-        description: "With `engine: codex` and `codex-credential: chatgpt`: what reviews when the ChatGPT login cannot be used. claude (the default) reviews on Claude, exactly as `engine: claude` would, with claude-credential and its secret: when the login is still lent to another job after codex-lease-wait, is not set, needs a new upload, cannot be read, when Checkmate does not answer, or when OpenAI refuses the login during the review. The run says so in a notice, the job summary, the review and the cost record. A policy refusal (public repository, workflow or owner not allowed, a token that does not verify) is a configuration error and is never fallen back from, and without a Claude credential nothing falls back. none fails the check instead, as before. An api-key credential is not lent, so it never falls back."
+        description: "With `engine: codex` and `codex-credential: chatgpt`: what reviews when the ChatGPT login cannot be used. claude (the default) reviews on Claude, exactly as `engine: claude` would, with claude-credential and its secret: when the review is still waiting in line for the login after codex-lease-wait, a newer run of the same pull request took its place in line, the login is not set, needs a new upload, cannot be read, when Checkmate does not answer, or when OpenAI refuses the login during the review. The run says so in a notice, the job summary, the review and the cost record. A policy refusal (public repository, workflow or owner not allowed, a token that does not verify) is a configuration error and is never fallen back from, and without a Claude credential nothing falls back. none fails the check instead, as before. An api-key credential is not lent, so it never falls back."
         type: string
         default: claude
       codex-lease-wait:
-        description: "With `codex-credential: chatgpt` and a Claude fallback: minutes to wait for the ChatGPT login while another job holds it, before reviewing on Claude. One login is lent to one job at a time, so on a busy repository collisions are expected. Without a fallback the wait is 10 minutes, as before, since there is nothing else to review with."
+        description: "With `codex-credential: chatgpt`: minutes a review waits in line for the ChatGPT login, 0 to 60. One login is lent to one job at a time; Checkmate lends it to the review that has waited longest, one place per pull request, and a newer run of a pull request keeps the place of the run it replaces. Past the wait the review falls back to Claude (codex-fallback: claude with a Claude credential) or fails; without a fallback it waits at least 10 minutes, as before. The wait runs on the runner and counts as Actions minutes. On this path the agent job may run 120 minutes (240 with a timeout-minutes over 60, 360 over 225) so that the wait fits; timeout-minutes still bounds the review step itself, and the wait is cut short when it would not leave the review its timeout-minutes."
         type: number
-        default: 2
+        default: 40
       reviewer-ref:
         description: "Ref of the reviewer repo to check out for the run. Defaults to the caller's own ref so a pinned caller stays pinned end to end; @main here would have quietly un-pinned it."
         type: string
@@ -238,7 +238,13 @@ jobs:
       # codex-fallback put the review on Claude.
       engine: ${{ steps.effective.outputs.engine }}
       fallback: ${{ steps.effective.outputs.fallback }}
-    timeout-minutes: ${{ inputs.timeout-minutes }}
+    # On a ChatGPT login the job may wait in line for it (codex-lease-wait)
+    # before a review of up to timeout-minutes, and an expression cannot add
+    # the two. So that path gets a fixed ceiling, 120 minutes, 240 for a
+    # timeout-minutes over 60, 360 (GitHub's limit) over 225; the review steps
+    # keep timeout-minutes as their own limit, and the engine step cuts the
+    # wait so the review still has it. Every other path is timeout-minutes, as before.
+    timeout-minutes: ${{ (inputs.engine != 'codex' || inputs.codex-credential != 'chatgpt') && inputs.timeout-minutes || (inputs.timeout-minutes <= 60 && 120 || (inputs.timeout-minutes <= 225 && 240 || 360)) }}
     permissions:
       contents: read
       pull-requests: read
@@ -693,12 +699,12 @@ jobs:
                   # Borrowed from the Checkmate console by the engine step,
                   # which says why when it cannot be.
                   echo "::warning title=ChatGPT login in CI::codex-credential 'chatgpt' runs this review on the tenant's ChatGPT plan, lent to one job at a time. OpenAI allows that for private automation only; api-key with a budget is the right credential for CI."
+                  case "${LEASE_WAIT:-}" in
+                    ''|*[!0-9]*) echo "::error title=Unknown codex-lease-wait::codex-lease-wait must be a whole number of minutes from 0 to 60, got '${LEASE_WAIT:-}'."; exit 1 ;;
+                  esac
+                  [ "$LEASE_WAIT" -le 60 ] || { echo "::error title=Unknown codex-lease-wait::codex-lease-wait must be a whole number of minutes from 0 to 60, got '$LEASE_WAIT'."; exit 1; }
                   case "${FALLBACK:-claude}" in
                     claude)
-                      case "${LEASE_WAIT:-}" in
-                        ''|*[!0-9]*) echo "::error title=Unknown codex-lease-wait::codex-lease-wait must be a whole number of minutes from 0 to 30, got '${LEASE_WAIT:-}'."; exit 1 ;;
-                      esac
-                      [ "$LEASE_WAIT" -le 30 ] || { echo "::error title=Unknown codex-lease-wait::codex-lease-wait must be a whole number of minutes from 0 to 30, got '$LEASE_WAIT'."; exit 1; }
                       if claude_check; then
                         echo "claude_ok=true" >> "$GITHUB_OUTPUT"
                       else
@@ -942,13 +948,22 @@ jobs:
       # exchanged for the auth.json, written to CODEX_HOME with mode 600. Its
       # own step, because the review steps have no OIDC request variables. One
       # login is lent to one job at a time, so on a busy repository another
-      # job often holds it. With codex-fallback: claude and a Claude
-      # credential, a login that cannot be lent for a reason that is not this
-      # caller's configuration (busy after codex-lease-wait, not set, needs a
-      # new upload, unreadable, Checkmate not answering) makes this a Claude
-      # review: engine=claude, fallback=<reason>, and nothing to give back.
-      # A policy refusal fails here whatever codex-fallback says. Without a
-      # fallback the login is waited for up to ten minutes, as before.
+      # job often holds it. The job waits in line for it: Checkmate lends it
+      # to the review that has waited longest, one place per pull request
+      # (--pull-request), and asking every 15 seconds is what keeps the place.
+      # With codex-fallback: claude and a Claude credential, a login that
+      # cannot be lent for a reason that is not this caller's configuration
+      # (still in line after codex-lease-wait, overtaken by a newer run of the
+      # pull request, not set, needs a new upload, unreadable, Checkmate not
+      # answering) makes this a Claude review: engine=claude,
+      # fallback=<reason>, and nothing to give back. A policy refusal fails
+      # here whatever codex-fallback says. Without a fallback the wait is
+      # codex-lease-wait and never less than the ten minutes it was. Either
+      # way the wait is cut so the review keeps its timeout-minutes inside the
+      # job's ceiling. A reviewer ref whose codex-login.sh predates the queue
+      # is called as before; against a Checkmate without the queue, the new
+      # one asks as before. The job summary says the place in line at the
+      # start, how long the job waited, and whether Codex reviewed.
       #
       # A granted lease with a fallback available also sets standby=claude:
       # the Claude CLI is installed as well, so that OpenAI refusing the
@@ -966,6 +981,8 @@ jobs:
           CLAUDE_WHY: ${{ steps.cred.outputs.claude_why }}
           CHECKMATE_URL: ${{ inputs.checkmate-url }}
           TIMEOUT: ${{ inputs.timeout-minutes }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          EVENT: ${{ github.event_name }}
         run: |
           set -uo pipefail
           engine="${ENGINE:-claude}"
@@ -981,12 +998,48 @@ jobs:
             elif ! grep -q -- '--fallback' scripts/codex-login.sh; then why="the reviewer at this ref cannot fall back (scripts/codex-login.sh has no --fallback)"
             else can=true; fi
           fi
-          wait=600; soft=()
-          if [ -n "$can" ]; then wait=$(( ${LEASE_WAIT:-2} * 60 )); soft=(--fallback); fi
+          wait=$(( ${LEASE_WAIT:-40} * 60 )); soft=(--fallback)
+          if [ -z "$can" ]; then soft=(); [ "$wait" -ge 600 ] || wait=600; fi
+          # The job's ceiling on this path (the job's timeout-minutes above):
+          # the wait may not eat into the review's own timeout-minutes, nor
+          # the quarter hour around it for setup and giving the login back.
+          ceiling=120; [ "${TIMEOUT:-45}" -le 60 ] || ceiling=240; [ "${TIMEOUT:-45}" -le 225 ] || ceiling=360
+          room=$(( (ceiling - ${TIMEOUT:-45} - 15) * 60 )); [ "$room" -ge 0 ] || room=0
+          [ "$wait" -le "$room" ] || wait="$room"
+          # A reviewer ref whose codex-login.sh predates the queue knows no
+          # --pull-request and reports no place in line. The place is the pull
+          # request's only for a run a pull request event started: a
+          # hand-started run is a retry in a concurrency group of its own, and
+          # must not take the place of the push run it does not cancel.
+          line=(); queued=""
+          if grep -q -- '--pull-request' scripts/codex-login.sh; then
+            queued=yes
+            case "${EVENT:-}:${PR_NUMBER:-}" in pull_request*:[0-9]*) case "$PR_NUMBER" in *[!0-9]*) ;; *) line=(--pull-request "$PR_NUMBER") ;; esac ;; esac
+          fi
           rc=0
+          # The lease must outlive the job (its return comes after the review
+          # and the replies), so it is asked for the job's ceiling; the script
+          # takes off what it waited.
           out="$(bash scripts/codex-login.sh lease --url "$CHECKMATE_URL" --home "$RUNNER_TEMP/codex-home" \
-                   --job agent --timeout-minutes "$TIMEOUT" --wait-seconds "$wait" ${soft[@]+"${soft[@]}"})" || rc=$?
+                   --job agent --timeout-minutes "$ceiling" --wait-seconds "$wait" ${soft[@]+"${soft[@]}"} ${line[@]+"${line[@]}"})" || rc=$?
           get() { printf '%s\n' "$out" | sed -n "s/^$1=//p" | head -1; }
+          # The queue, said once in the job summary: the place at the start,
+          # the time waited, and what reviewed. Numbers only, checked as such.
+          pos="$(get queue_position)"; case "$pos" in *[!0-9]*) pos="" ;; esac
+          waited="$(get waited_seconds)"; case "$waited" in ''|*[!0-9]*) waited="" ;; esac
+          [ -z "$pos" ] || echo "queue_position=$pos" >> "$GITHUB_OUTPUT"
+          [ -z "$waited" ] || echo "waited_seconds=$waited" >> "$GITHUB_OUTPUT"
+          queue_summary() {  # queue_summary <what reviewed>
+            {
+              echo "### ChatGPT login"
+              echo ""
+              if [ -z "$queued" ]; then echo "- place in line at the start: not reported (the reviewer ref predates the queue)"
+              elif [ -n "$pos" ]; then echo "- place in line at the start: $pos"
+              else echo "- place in line at the start: none, it was lent at the first ask"; fi
+              [ -z "$waited" ] || echo "- waited: $((waited / 60)) min $((waited % 60)) s (codex-lease-wait: up to $((wait / 60)) min)"
+              echo "- reviewed on: $1"
+            } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+          }
           if [ "$rc" -eq 0 ]; then
             id="$(get lease_id)"
             [ -n "$id" ] || { echo "::error title=No ChatGPT lease::Checkmate lent the login without a lease id."; exit 1; }
@@ -995,9 +1048,11 @@ jobs:
               echo "lease_id=$id"
               [ -z "$can" ] || echo "standby=claude"
             } >> "$GITHUB_OUTPUT"
+            queue_summary "**Codex**, on the ChatGPT login"
             exit 0
           fi
           if [ "$rc" -ne 3 ]; then
+            queue_summary "nothing: the check fails"
             # Its reason is above. Say why it did not become a Claude review.
             if [ "${FALLBACK:-claude}" = claude ] && [ -n "$why" ]; then
               echo "::error title=No fallback to Claude::codex-fallback is 'claude', but $why, so the review did not run on Claude either."
@@ -1005,15 +1060,39 @@ jobs:
             exit 1
           fi
           reason="$(get refused)"; detail="$(get detail)"
+          # A place a newer run of the pull request took is said as busy, so a
+          # workflow from before the queue still falls back on it; here it has its name.
+          [ "$reason" != busy ] || [ "$(get superseded)" != true ] || reason=superseded
           case "$reason" in
-            busy|login_not_set|login_needs_reupload|secret_unreadable|unreachable|login_unusable) ;;
+            busy|superseded|login_not_set|login_needs_reupload|secret_unreadable|unreachable|login_unusable) ;;
             *) echo "::error title=ChatGPT login not lent::codex-login.sh gave no reason the workflow knows ('$reason')."; exit 1 ;;
           esac
+          queue_summary "**Claude** (\`$reason\`)"
           {
             echo "engine=claude"
             echo "fallback=$reason"
             echo "detail=$detail"
           } >> "$GITHUB_OUTPUT"
+
+      # A job cancelled (a push to the pull request, a person) or failed
+      # while in line for the ChatGPT login gives its place up. codex-login.sh
+      # does that itself on the way out; this is for when it was killed
+      # before it could. Cancelled keeps the pull request's place a few
+      # minutes for the run that replaces this one. A Checkmate or a reviewer
+      # ref without the queue has nothing to give up.
+      - name: Give up the place in line for the ChatGPT login
+        if: always() && inputs.codex-credential == 'chatgpt' && (steps.engine.outcome == 'cancelled' || steps.engine.outcome == 'failure')
+        continue-on-error: true
+        timeout-minutes: 2
+        working-directory: .lindamar-reviewer
+        env:
+          CHECKMATE_URL: ${{ inputs.checkmate-url }}
+          OUTCOME: ${{ steps.engine.outcome }}
+        run: |
+          set -uo pipefail
+          grep -q '^  leave)' scripts/codex-login.sh || exit 0
+          why=left; [ "${OUTCOME:-}" != cancelled ] || why=cancelled
+          bash scripts/codex-login.sh leave --url "$CHECKMATE_URL" --job agent --why "$why" || true
 
       - name: Install the Claude CLI
         id: cli
@@ -1202,6 +1281,8 @@ jobs:
       - name: Review with Codex
         id: review_codex
         if: steps.already.outputs.skip != 'true' && steps.triage.outputs.skip == '' && steps.engine.outputs.engine == 'codex'
+        # The review's own limit: on a ChatGPT login the job's is higher, to fit the wait in line.
+        timeout-minutes: ${{ inputs.timeout-minutes }}
         working-directory: .lindamar-reviewer
         env:
           CODEX_API_KEY: ${{ steps.engine.outputs.engine == 'codex' && inputs.codex-credential == 'api-key' && secrets.OPENAI_API_KEY || '' }}
@@ -1303,6 +1384,7 @@ jobs:
           DETAIL: ${{ steps.engine.outputs.detail }}
           CRED: ${{ inputs.claude-credential }}
           WAITED: ${{ inputs.codex-lease-wait }}
+          WAITED_SECONDS: ${{ steps.engine.outputs.waited_seconds }}
         run: |
           set -uo pipefail
           engine="$ENGINE"
@@ -1313,6 +1395,7 @@ jobs:
           d="$(printf '%s' "${DETAIL:-}" | tr -d '\000-\037' | sed 's/::/: /g' | cut -c1-300)"
           case "$FALLBACK" in
             busy)                 why="Codex login ${d:-lent to another job}" ;;
+            superseded)           why="A newer run of this pull request took this run's place in line for the ChatGPT login" ;;
             login_not_set)        why="No ChatGPT login is set in Checkmate${d:+ ($d)}" ;;
             login_needs_reupload) why="The ChatGPT login needs a new upload in Checkmate${d:+ ($d)}" ;;
             secret_unreadable)    why="Checkmate could not read the ChatGPT login${d:+ ($d)}" ;;
@@ -1330,12 +1413,19 @@ jobs:
             echo "- asked for: Codex, on the ChatGPT login"
             echo "- reviewed on: **Claude**, claude-credential \`$CRED\` (\`codex-fallback: claude\`)"
             echo "- reason: \`$FALLBACK\`"
-            [ "$FALLBACK" != busy ] || echo "- waited: up to ${WAITED:-2} minute(s) (\`codex-lease-wait\`)"
+            if [ "$FALLBACK" = busy ]; then
+              case "${WAITED_SECONDS:-}" in
+                ''|*[!0-9]*) echo "- waited: up to ${WAITED:-40} minute(s) (\`codex-lease-wait\`)" ;;
+                *) echo "- waited: $((WAITED_SECONDS / 60)) min $((WAITED_SECONDS % 60)) s in line, of up to ${WAITED:-40} minute(s) (\`codex-lease-wait\`)" ;;
+              esac
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Review
         if: steps.already.outputs.skip != 'true' && steps.triage.outputs.skip == '' && steps.reserve.outputs.blocked == '' && steps.effective.outputs.engine == 'claude'
         id: review
+        # The review's own limit: on a ChatGPT login the job's is higher, to fit the wait in line.
+        timeout-minutes: ${{ inputs.timeout-minutes }}
         working-directory: .lindamar-reviewer
         env:
           GH_TOKEN: ${{ github.token }}
@@ -2056,6 +2146,7 @@ jobs:
           if [ "${ENGINE:-}" = claude ]; then
             case "${FALLBACK:-}" in
               busy)                 fb="the ChatGPT login was lent to another job" ;;
+              superseded)           fb="a newer run of this pull request took its place in line for the ChatGPT login" ;;
               login_not_set)        fb="no ChatGPT login is set in Checkmate" ;;
               login_needs_reupload) fb="the ChatGPT login needs a new upload" ;;
               secret_unreadable)    fb="Checkmate could not read the ChatGPT login" ;;
