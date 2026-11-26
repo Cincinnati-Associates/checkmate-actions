@@ -38,6 +38,10 @@ name: Checkmate agent fix
 #            Then it checks, with no model: one JS lockfile per directory, a
 #            frozen install passes, the target version resolves in every
 #            lockfile, nothing under .github/. A failure opens no pull request.
+#   gate     replace_parent only, and no secret, no OIDC, no credential in
+#            the checkout: a frozen install, then the typecheck and the build,
+#            each under env -i, 15 minutes at most. A stage that passes on the
+#            default branch and fails after the change is the pass's finding.
 #   publish  a write token for this repository from Checkmate, fetched here,
 #            and no Claude credential. It
 #            applies the resolved patch to a fresh checkout, commits with hooks

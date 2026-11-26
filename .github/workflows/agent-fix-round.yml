@@ -786,6 +786,149 @@ jobs:
           path: ${{ runner.temp }}/change
           retention-days: 1
 
+  # replace_parent only: the agent replaced a dependency and migrated the code
+  # that used it, which a lockfile check cannot judge. Before any pull request,
+  # the changed package directory is installed from its lockfile, typechecked
+  # and built, and a failure goes back to the agent as a merge-blocking
+  # finding. The repository's own code runs here, so this job holds nothing:
+  # no secret, no OIDC, a read-only GITHUB_TOKEN that is never in the
+  # environment, a checkout without credentials, and each command under env -i.
+  # Only a stage that passes on the default branch can block: one that already
+  # fails there (a build that needs runtime secrets, say) is said, not held
+  # against the agent. Tests are not run.
+  gate:
+    name: Checkmate agent fix (build and typecheck, pass ${{ inputs.round }})
+    needs: [agent, resolve]
+    if: needs.agent.outputs.reason == 'replace_parent'
+    runs-on: ${{ vars.LINDAMAR_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      result: ${{ steps.verdict.outputs.result }}
+      findings: ${{ steps.verdict.outputs.findings }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: checkmate-resolved-${{ github.run_id }}-r${{ inputs.round }}
+          path: ${{ runner.temp }}/change
+
+      - name: Apply the resolved change
+        run: |
+          set -euo pipefail
+          patch="$RUNNER_TEMP/change/resolved.patch"
+          git apply --numstat "$patch" | cut -f3 | while IFS= read -r p; do
+            case "$p" in .github/*|.git/*|*/.git/*) echo "::error title=Refused::the patch touches $p"; exit 1 ;; esac
+          done
+          git apply --index "$patch"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - uses: oven-sh/setup-bun@v2
+        if: endsWith(needs.agent.outputs.lockfile, 'bun.lock')
+
+      - name: Build and typecheck
+        id: gate
+        continue-on-error: true
+        env:
+          LOCKFILE: ${{ needs.agent.outputs.lockfile }}
+        run: |
+          set -uo pipefail
+          dir="$(dirname "$LOCKFILE")"; base="$(basename "$LOCKFILE")"
+          out="$RUNNER_TEMP/gate"; mkdir -p "$out" "$RUNNER_TEMP/gate-home"
+          # The repository's code runs under this: nothing of the runner's
+          # environment (GITHUB_*, ACTIONS_*, RUNNER_*), only a PATH and an empty home.
+          clean() {
+            env -i PATH="$PATH" HOME="$RUNNER_TEMP/gate-home" LANG=C.UTF-8 CI=true \
+              COREPACK_ENABLE_DOWNLOAD_PROMPT=0 NEXT_TELEMETRY_DISABLED=1 YARN_ENABLE_SCRIPTS=false "$@"
+          }
+          pm="$(jq -r '.packageManager // ""' "$dir/package.json" 2>/dev/null || true)"
+          case "$base" in
+            package-lock.json|npm-shrinkwrap.json)
+              install=(npm ci --ignore-scripts --no-audit --no-fund); runner=(npm run) ;;
+            pnpm-lock.yaml)
+              corepack enable
+              case "$pm" in pnpm@*) p=(pnpm) ;; *) p=(corepack pnpm@10.34.6) ;; esac
+              install=("${p[@]}" install --frozen-lockfile --ignore-scripts); runner=("${p[@]}" run) ;;
+            yarn.lock)
+              corepack enable
+              if grep -q '^__metadata:' "$LOCKFILE"; then install=(yarn install --immutable --mode=skip-build); runner=(yarn run)
+              else install=(corepack yarn@1.22.22 install --frozen-lockfile --ignore-scripts --non-interactive); runner=(corepack yarn@1.22.22 run); fi ;;
+            bun.lock)
+              install=(bun install --frozen-lockfile --ignore-scripts); runner=(bun run) ;;
+            *) echo "::notice title=No build gate::$LOCKFILE is not a JS lockfile; nothing to build"; exit 0 ;;
+          esac
+          has() { jq -e --arg s "$2" '.scripts[$s] // empty' "$1/package.json" >/dev/null 2>&1; }
+          # gate <checkout> <label>: run the stages in <checkout>/$dir, logged to
+          # $out/<label>.log; print the first stage that fails, else nothing.
+          gate() {
+            local d="$1/$dir" log="$out/$2.log"
+            : > "$log"
+            if ! has "$d" typecheck && ! has "$d" build && [ ! -f "$d/tsconfig.json" ]; then return 0; fi
+            ( cd "$d" && clean "${install[@]}" ) >> "$log" 2>&1 || { echo install; return 0; }
+            if has "$d" typecheck; then
+              ( cd "$d" && clean "${runner[@]}" typecheck ) >> "$log" 2>&1 || { echo typecheck; return 0; }
+            elif [ -f "$d/tsconfig.json" ] && [ -x "$d/node_modules/.bin/tsc" ]; then
+              ( cd "$d" && clean node_modules/.bin/tsc --noEmit ) >> "$log" 2>&1 || { echo typecheck; return 0; }
+            elif [ -f "$d/tsconfig.json" ]; then
+              echo "::notice title=No typecheck::$dir has a tsconfig.json but no typecheck script and no typescript installed" >&2
+            fi
+            if has "$d" build; then
+              ( cd "$d" && clean "${runner[@]}" build ) >> "$log" 2>&1 || { echo build; return 0; }
+            fi
+          }
+          if ! has "$dir" typecheck && ! has "$dir" build && [ ! -f "$dir/tsconfig.json" ]; then
+            echo "::notice title=No build gate::$dir/package.json has no typecheck or build script and there is no tsconfig.json; nothing was built"
+            echo "No build or typecheck to run in \`$dir\`." >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+            exit 0
+          fi
+          git worktree add -q --detach "$RUNNER_TEMP/base" HEAD   # the default branch, before the change
+          failed="$(gate "$PWD" change)"
+          if [ -z "$failed" ]; then
+            echo "  install, typecheck and build pass after the change"
+            exit 0
+          fi
+          before="$(gate "$RUNNER_TEMP/base" base)"
+          rank() { case "$1" in install) echo 1 ;; typecheck) echo 2 ;; build) echo 3 ;; *) echo 9 ;; esac; }
+          if [ -n "$before" ] && [ "$(rank "$before")" -le "$(rank "$failed")" ]; then
+            echo "::warning title=Build gate not applied::$failed fails after the change, but $before already fails on the default branch, so it cannot tell the change apart"
+            exit 0
+          fi
+          # Printable text only, capped: it goes back to the agent as feedback.
+          tail -n 40 "$out/change.log" | LC_ALL=C tr -cd '\11\12\40-\176' | tail -c 2000 > "$out/tail.txt"
+          echo "$failed" > "$out/stage"
+          echo "::error title=Build gate failed::$failed fails after the change and passes on the default branch: $(tail -c 600 "$out/tail.txt" | tr '\n' ' ')"
+          exit 1
+
+      - name: Decide
+        id: verdict
+        env:
+          OUTCOME: ${{ steps.gate.outcome }}
+          LOCKFILE: ${{ needs.agent.outputs.lockfile }}
+        run: |
+          set -euo pipefail
+          if [ "$OUTCOME" = success ]; then
+            { echo "result=passed"; echo "findings=[]"; } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          stage="$(tr -cd 'a-z' < "$RUNNER_TEMP/gate/stage" 2>/dev/null | head -c 20 || true)"
+          stage="${stage:-install}"
+          tail="$(tail -c 560 "$RUNNER_TEMP/gate/tail.txt" 2>/dev/null || true)"
+          manifest="$(dirname "$LOCKFILE")/package.json"; manifest="${manifest#./}"
+          findings="$(jq -cn --arg s "$stage" --arg f "$manifest" --arg t "$tail" \
+            '[{rule: "build-gate", severity: "critical", file: $f, line: 1,
+               title: ("the " + $s + " fails after the change and passes on the default branch"),
+               fixPrompt: ("Make the " + $s + " pass without deleting anything. Its output ends: " + $t)}]')"
+          { echo "result=failed"; echo "findings=$findings"; } >> "$GITHUB_OUTPUT"
+          echo "### Build gate: the $stage fails" >> "$GITHUB_STEP_SUMMARY"
+
   # layer 3: the pre-publish self-review. The resolved change is
   # reviewed against the same rule skills, by the same enumerators, from the
   # same reviewer ref as Lindamar review; its merge-blocking findings go back to
@@ -801,7 +944,9 @@ jobs:
   # lindamar-review-pr.
   prereview:
     name: Checkmate agent fix (pre-review, pass ${{ inputs.round }})
-    needs: [agent, resolve]
+    needs: [agent, resolve, gate]
+    # gate runs for replace_parent alone; skipped, it holds nothing back.
+    if: ${{ !cancelled() && needs.resolve.result == 'success' && (needs.gate.result == 'success' || needs.gate.result == 'skipped') }}
     runs-on: ${{ vars.LINDAMAR_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: ${{ inputs.timeout-minutes }}
     permissions:
@@ -849,6 +994,7 @@ jobs:
           node-version: "22"
 
       - name: Run the review's enumerators on the change
+        if: needs.gate.outputs.result != 'failed'
         env:
           REPO: ${{ github.repository }}
           CHECKMATE_LOCAL: ${{ github.workspace }}/target
@@ -876,12 +1022,26 @@ jobs:
           wc -c "$RUNNER_TEMP"/inventory/*.json
 
       - name: Install the Claude CLI
+        if: needs.gate.outputs.result != 'failed'
         run: |
           npm install -g "@anthropic-ai/claude-code@${LINDAMAR_CLAUDE_CLI_VERSION}"
           claude --version
 
+      # A failed build gate is this pass's finding: no model is spent reviewing
+      # a change that does not build, and the next pass gets it as feedback.
+      - name: Take the build gate's finding
+        if: needs.gate.outputs.result == 'failed'
+        env:
+          GATE: ${{ needs.gate.outputs.findings }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$GATE" | jq -e 'type == "array" and length > 0' >/dev/null \
+            || { echo "::error title=Build gate::it failed and said nothing"; exit 1; }
+          printf '%s' "$GATE" > "$RUNNER_TEMP/prereview.json"
+
       - name: Pre-review
         id: review
+        if: needs.gate.outputs.result != 'failed'
         working-directory: target
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
