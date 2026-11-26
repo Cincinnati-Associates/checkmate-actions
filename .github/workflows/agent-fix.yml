@@ -38,6 +38,10 @@ name: Checkmate agent fix
 #            Then it checks, with no model: one JS lockfile per directory, a
 #            frozen install passes, the target version resolves in every
 #            lockfile, nothing under .github/. A failure opens no pull request.
+#   gate     replace_parent only, and no secret, no OIDC, no credential in
+#            the checkout: a frozen install, then the typecheck and the build,
+#            each under env -i, 15 minutes at most. A stage that passes on the
+#            default branch and fails after the change is the pass's finding.
 #   publish  a write token for this repository from Checkmate, fetched here,
 #            and no Claude credential. It
 #            applies the resolved patch to a fresh checkout, commits with hooks
@@ -50,7 +54,7 @@ name: Checkmate agent fix
 # under .github/ before it is applied.
 #
 # The prompt is built from the dispatch's fields and nothing else, each checked
-# against a fixed shape; the reason is one of four codes whose instructions
+# against a fixed shape; the reason is one of the codes whose instructions
 # live here. No pull request text reaches the agent.
 #
 # Why the App and not GITHUB_TOKEN for the push: a pull request opened with
@@ -71,7 +75,7 @@ on:
         type: string
         required: true
       task:
-        description: "The suggestion, as JSON: package, ecosystem, lockfile, from, to, reason, slug. Set by the Checkmate console."
+        description: "The suggestion, as JSON: package, ecosystem, lockfile, from, to, reason, slug, and via for replace_parent. Set by the Checkmate console."
         type: string
         required: true
       model:
@@ -322,6 +326,7 @@ jobs:
       branch: ${{ steps.pick.outputs.branch }}
       manager: ${{ steps.pick.outputs.manager }}
       remove: ${{ steps.pick.outputs.remove }}
+      via: ${{ steps.pick.outputs.via }}
     steps:
       - name: Pick the clean pass
         id: pick
@@ -350,7 +355,7 @@ jobs:
           fi
           out="$(printf '%s' "$ROUNDS" | jq -c --arg k "$clean" '.[$k].outputs')"
           echo "round=${clean#round}" >> "$GITHUB_OUTPUT"
-          for k in package ecosystem lockfile from to reason branch manager remove; do
+          for k in package ecosystem lockfile from to reason branch manager remove via; do
             echo "$k=$(printf '%s' "$out" | jq -r --arg k "$k" '.[$k] // ""')" >> "$GITHUB_OUTPUT"
           done
 
@@ -453,6 +458,7 @@ jobs:
           REASON: ${{ needs.decide.outputs.reason }}
           MANAGER: ${{ needs.decide.outputs.manager }}
           REMOVE: ${{ needs.decide.outputs.remove }}
+          VIA: ${{ needs.decide.outputs.via }}
           ROUNDS: ${{ needs.decide.outputs.rounds }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
@@ -468,6 +474,10 @@ jobs:
               title="Checkmate: Migrate $where to pnpm"
               what="Imports the existing lockfile into \`$LOCKFILE\` with pnpm import, removes \`$REMOVE\`, pins \`packageManager\` to pnpm, and adds \`.npmrc\` with \`minimum-release-age\` and \`only-built-dependencies\`."
               message="deps: migrate to pnpm (Checkmate agent fix)" ;;
+            replace_parent)
+              title="Checkmate: Replace $VIA to move $PACKAGE off $FROM"
+              what="Replaces \`$VIA\`, which pins the vulnerable major of the $ECOSYSTEM package \`$PACKAGE\`, so \`$PACKAGE\` moves from **$FROM** to **$TO** or later in \`$LOCKFILE\`, and migrates the code that used \`$VIA\`. **This changes application code, not only dependencies:** the agent lists what changed in the UI in its summary below, under \"UI changes\"."
+              message="deps: replace $VIA to move $PACKAGE off $FROM (Checkmate agent fix)" ;;
             harden_scripts)
               title="Checkmate: Turn off install scripts for $MANAGER in $where"
               what="Keeps $MANAGER and turns dependency install scripts off in its settings file, with the install commands outside \`.github/\` changed to match."
@@ -490,11 +500,21 @@ jobs:
           summary="$(head -c 3000 "$RUNNER_TEMP/change/summary.md" 2>/dev/null | sed 's/@/@​/g; s/</\&lt;/g' || true)"
           # Measured by the resolve job, not written by the agent.
           lockfile_note="$(head -c 3000 "$RUNNER_TEMP/change/lockfile-note.md" 2>/dev/null || true)"
+          # Replacing a parent changes code: the agent's "UI changes" section gets
+          # its own heading, so a reviewer cannot miss it. The resolve job refused
+          # a summary without one. mawk on the runner: no IGNORECASE.
+          ui=""
+          if [ "$REASON" = replace_parent ]; then
+            ui="$(printf '%s\n' "$summary" | awk '{ l = tolower($0) }
+              l ~ /^#*[ \t]*ui changes/ { on = 1; next }  on && /^#/ { exit }  on { print }')"
+            [ -n "$ui" ] || ui="_The summary lists no UI change under that heading; read the diff of every component it touched._"
+          fi
           case "$REASON" in
             yarn_v1_lockfile) why="\`$LOCKFILE\` is a Yarn 1 lockfile, which Checkmate's resolver does not regenerate, so the upgrade could not be opened automatically." ;;
             lockfile_unsupported) why="\`$LOCKFILE\` is in a format Checkmate's resolver does not regenerate." ;;
             transitive_no_override) why="\`$PACKAGE\` is transitive here, and the lockfile gives no override path to it." ;;
             breaking_major) why="$TO is a new major version of \`$PACKAGE\`, so code that uses it may need to change with it." ;;
+            replace_parent) why="\`$PACKAGE\` $FROM is transitive here, brought in only by \`$VIA\`. No release of \`$VIA\` allows a fixed \`$PACKAGE\`, and the fix, $TO, is a new major, so an override would run \`$VIA\` on an API it was not built for. The only fix is to stop depending on \`$VIA\`." ;;
             consolidate_lockfiles) why="\`$dir\` had more than one lockfile, which drift apart and are scanned twice. Checkmate read which package manager is in use from the repository and the signals agreed on $MANAGER." ;;
             migrate_pnpm) why="An admin chose the pnpm migration from the Packages tab: pnpm runs no dependency install script unless it is listed, and waits \`minimum-release-age\` minutes before installing a new release." ;;
             harden_scripts) why="An admin chose the lighter hardening from the Packages tab: dependency install scripts no longer run on install." ;;
@@ -503,6 +523,8 @@ jobs:
             consolidate_lockfiles) clean=""; check="Apply the \"CI changes\" in the agent's summary, if any, so CI installs with $MANAGER too." ;;
             migrate_pnpm) clean=""; check="Apply the \"CI changes\" in the agent's summary (\`corepack enable\`, \`pnpm install --frozen-lockfile\`). If the build fails on a missing module, add \`node-linker=hoisted\` to \`.npmrc\`." ;;
             harden_scripts) clean=""; check="Apply the \"CI changes\" in the agent's summary, and check the dependencies it lists as needing their install scripts still work." ;;
+            replace_parent) clean=" $TO is the lowest version Checkmate's package-facts database checked clean; the replacement may need a later one, which this run checked only to be $TO or later and which the review's dependency rules read."
+               check="Run the application and open every screen listed under \"UI changes\" in the agent's summary, beside the same screen on \`$BASE\`: each control the old \`$VIA\` rendered must still be there and work. Check that \`$VIA\` and \`$PACKAGE\` $FROM are gone from \`$LOCKFILE\`." ;;
             *) clean=" The target version is the one Checkmate's package-facts database checked clean."
                check="Check that \`$LOCKFILE\` resolves \`$PACKAGE\` to exactly $TO." ;;
           esac
@@ -519,7 +541,11 @@ jobs:
 
           $(git show --stat --format= HEAD | sed 's/^/    /')
 
-          ## Why
+          ${ui:+## What changed in the UI
+
+          $ui
+
+          }## Why
 
           $why$clean
 
