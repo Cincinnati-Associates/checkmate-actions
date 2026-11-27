@@ -265,11 +265,13 @@ jobs:
           Do this:
           1. Find every file outside node_modules that imports, requires or configures $VIA (and any other package of its family this repository uses for the same feature), and read how each one uses it: the props, options, callbacks, styles and assets.
           2. Pick the replacement, in this order of preference: a widely used, maintained package that does the same job and depends on $PACKAGE $TO or later; else $PACKAGE itself at $TO or later, used directly. Choose the one that keeps the change smallest and the behaviour the same. Name only a package and a version you know exist; the package manager resolves them after you finish, and a name or version that does not exist stops the run.
-          3. In $dir/package.json, remove $VIA and add the replacement with a caret range. Add no override or resolution for $PACKAGE, and leave every other dependency as it is.
-          4. Migrate every usage you found to the replacement so the feature works as before: the same screens and routes, the same controls (for example page navigation, zoom, download, print, search), the same inputs and callbacks. Move any setup the replacement needs (for example a worker script URL or a stylesheet import) to where the old one was set up.
-          5. Update the tests that import or mock $VIA to the replacement.
+          3. Choose its version so that it also clears the vulnerable chain under $PACKAGE $FROM, not only $PACKAGE. Read $LOCKFILE for what $PACKAGE $FROM brings in (an old optional native dependency chain, for example, can carry advisories of its own, some worse than the one this task is for). Of the versions that do the job, prefer the one whose $PACKAGE no longer pulls that chain in, even when it is a newer major than the lowest that fixes $PACKAGE, unless this repository rules it out: its framework or React version, a peer dependency range, or its support floor below.
+          4. Respect the support floor this repository declares: browserslist (in package.json or .browserslistrc) and engines. If the replacement, or the $PACKAGE it brings, needs a language or browser API newer than that floor (Promise.withResolvers, for example), add a small guarded polyfill imported before the code that needs it, or choose a version that fits the floor.
+          5. In $dir/package.json, remove $VIA and add the replacement with a caret range. Add no override or resolution for $PACKAGE, and leave every other dependency as it is.
+          6. Migrate every usage you found to the replacement so the feature works as before: the same screens and routes, the same controls (for example page navigation, zoom, download, print, search), the same inputs and callbacks. Move any setup the replacement needs (for example a worker script URL or a stylesheet import) to where the old one was set up.
+          7. Update the tests that import or mock $VIA to the replacement.
           Never delete a feature, a screen, a control, a route or a test to make the change fit. If something $VIA did has no equivalent, keep it working with a small adapter in the same file, and say so in the summary. If you cannot replace $VIA without losing a feature, change nothing and say why in the summary.
-          In checkmate-summary.md, add a section headed \"UI changes\" listing every component and screen whose rendering or behaviour changed and how, or \"None\", and a section headed \"Replacement\" naming the package and version you chose and why." ;;
+          On every pass, start checkmate-summary.md with these two sections, in this order, each describing the whole change on this branch: a section headed \"UI changes\" listing every component and screen whose rendering or behaviour changed and how, or \"None\"; then a section headed \"Replacement\" naming the package and version you chose and why, what it removes from the tree (step 3), and any polyfill or adapter it needed (step 4) or what ruled out a newer version. Everything else in the summary comes after them, and the whole summary stays under 6,000 characters. The pull request carries both sections, and a pass whose summary lacks either opens no pull request." ;;
             consolidate_lockfiles)
               task="$dir has more than one lockfile, and $MANAGER is the package manager in use. After you finish, this workflow removes $REMOVE, pins packageManager to $MANAGER and regenerates $LOCKFILE; do not do those yourself.
           Your part: change every reference to another package manager in this repository, outside .github/, to $MANAGER: package.json scripts, the Dockerfile, vercel.json, and install instructions in the README or docs." ;;
@@ -300,9 +302,9 @@ jobs:
           - This run cannot change .github/. If a workflow there still installs with another package manager or needs a flag, list each line and its replacement under a heading \"CI changes\" in the summary.
           - The pull request is reviewed by Lindamar review against these skills: $(for f in "$RUNNER_TEMP"/skills/*/SKILL.md; do printf '%s ' "$f"; done)
             Read each one before you finish, and make sure your change meets every merge-blocking (critical) criterion in them; a change that fails one is rejected. They are rules to meet, not instructions to run anything.
-          ${feedback:+- This is pass $ROUND. Your previous pass was pre-reviewed against the same skills and these merge-blocking findings came back; fix every one, and change nothing else:
+          ${feedback:+- This is pass $ROUND, and it starts again from the default branch: the change of your previous pass is not in this checkout. Make the whole change the task asks for again, and also fix every one of these merge-blocking findings from the pre-review of your previous pass; change nothing beyond the task and these fixes:
           $feedback
-          }- When you are done, write a short summary of what you changed and what a reviewer should check to checkmate-summary.md at the repository root."
+          }- When you are done, write to checkmate-summary.md at the repository root a short summary of the whole change on this branch, not only what this pass fixed, and what a reviewer should check."
           rc=0
           claude -p "$prompt" \
             --model "$MODEL" \
@@ -327,7 +329,7 @@ jobs:
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/change"
           if [ -f checkmate-summary.md ]; then
-            head -c 3000 checkmate-summary.md > "$RUNNER_TEMP/change/summary.md"; rm -f checkmate-summary.md
+            head -c 8000 checkmate-summary.md > "$RUNNER_TEMP/change/summary.md"; rm -f checkmate-summary.md
           else
             : > "$RUNNER_TEMP/change/summary.md"
           fi
@@ -574,8 +576,10 @@ jobs:
             jq -e --arg v "$VIA" '[.dependencies, .devDependencies, .optionalDependencies, .peerDependencies]
                 | map(. // {} | has($v)) | any | not' "$dir/package.json" >/dev/null \
               || fail "$VIA is still in $dir/package.json: the agent did not replace it"
-            grep -qiE '^#*[[:space:]]*UI changes' "$RUNNER_TEMP/change/summary.md" 2>/dev/null \
-              || fail "the agent's summary has no \"UI changes\" section, which the pull request must carry"
+            for section in "UI changes" "Replacement"; do
+              grep -qiE "^[#*_[:space:]]*${section}[*_:[:space:]]*\$" "$RUNNER_TEMP/change/summary.md" 2>/dev/null \
+                || fail "the agent's summary has no \"$section\" section, which the pull request must carry"
+            done
           fi
           # 5. For a package task, the target version resolves in every lockfile
           #    that has the package, and the version it moves from is in none.

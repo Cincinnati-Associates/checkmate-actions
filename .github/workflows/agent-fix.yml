@@ -497,17 +497,24 @@ jobs:
 
           # The summary is the agent's; it is quoted as its words, capped, and
           # carries no mentions or HTML.
-          summary="$(head -c 3000 "$RUNNER_TEMP/change/summary.md" 2>/dev/null | sed 's/@/@​/g; s/</\&lt;/g' || true)"
+          summary="$(head -c 8000 "$RUNNER_TEMP/change/summary.md" 2>/dev/null | sed 's/@/@​/g; s/</\&lt;/g' || true)"
           # Measured by the resolve job, not written by the agent.
           lockfile_note="$(head -c 3000 "$RUNNER_TEMP/change/lockfile-note.md" 2>/dev/null || true)"
           # Replacing a parent changes code: the agent's "UI changes" section gets
           # its own heading, so a reviewer cannot miss it. The resolve job refused
           # a summary without one. mawk on the runner: no IGNORECASE.
-          ui=""
+          # section <name>: the summary's section of that name, up to the next
+          # heading (written with #, or as a line in bold alone).
+          section() {
+            printf '%s\n' "$summary" | awk -v want="$1" '{ l = tolower($0); h = l; gsub(/[#*_:]/, "", h); gsub(/^[ \t]+|[ \t]+$/, "", h) }
+              on && (/^#/ || /^[*_][*_][^*_].*[*_][*_]:?[ \t]*$/) { exit }
+              h == want && (/^#/ || /^[*_]/) { on = 1; next }  on { print }'
+          }
+          ui=""; replacement=""
           if [ "$REASON" = replace_parent ]; then
-            ui="$(printf '%s\n' "$summary" | awk '{ l = tolower($0) }
-              l ~ /^#*[ \t]*ui changes/ { on = 1; next }  on && /^#/ { exit }  on { print }')"
+            ui="$(section "ui changes")"
             [ -n "$ui" ] || ui="_The summary lists no UI change under that heading; read the diff of every component it touched._"
+            replacement="$(section "replacement")"
           fi
           case "$REASON" in
             yarn_v1_lockfile) why="\`$LOCKFILE\` is a Yarn 1 lockfile, which Checkmate's resolver does not regenerate, so the upgrade could not be opened automatically." ;;
@@ -544,6 +551,10 @@ jobs:
           ${ui:+## What changed in the UI
 
           $ui
+
+          }${replacement:+## The replacement
+
+          $replacement
 
           }## Why
 
